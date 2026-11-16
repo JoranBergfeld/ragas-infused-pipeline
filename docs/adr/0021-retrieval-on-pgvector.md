@@ -231,6 +231,14 @@ Text is the only input today. The prompt goes through `EmbeddingSpec.document_te
 which says it's text-only, so an image document gets its own input builder beside it
 rather than a text assumption to unpick.
 
+**The settings, from a retrieval-only comparison on the real corpus**
+(`scripts/compare_embeddings.py`, `docs/eval-history.md` 2026-11-16): 768 dimensions,
+`task: question answering | query: ` and `title: none | text: `. On `ms_docs`, Gemma
+shows no measurable difference from `text-embedding-3-small`. On the plain `baseline`
+table it loses about 4 of 43 gold pages from the fused candidates. That's recorded as the
+expected cost of choosing a multimodal model. The full eval after the re-ingest is the
+real measurement.
+
 ### Rejected (#47)
 
 - **Prompts inside each `TableSpec.embed_input`.** Those lambdas say *what* a table embeds;

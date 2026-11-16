@@ -6,6 +6,74 @@ log of what they said before, so a re-run doesn't quietly erase the last baselin
 Newest first. Means over `data/testset.jsonl`. With n in the tens, treat anything inside
 the confidence intervals as "no measurable difference" (ADR-0018).
 
+## 2026-11-16: EmbeddingGemma 2 settings, retrieval only (#47)
+
+This isn't a mode run, and no `eval_results_*.json` changed. It was a check, before
+switching the embedder to `google/embeddinggemma-2` on the Spark (chosen for
+multimodality, homelab #220), of which Gemma settings to use and how big the regression
+is against `text-embedding-3-small@1536`. Run with `scripts/compare_embeddings.py`. The
+2026-10-24 export's `ms_docs` and `baseline` (7,944 rows each) were loaded into scratch
+databases, and the 43 hand-authored questions went through the production
+`HybridSubstrate` (dense 15 + BM25 15, RRF k=60). Scoring is URL hit rate / MRR over the
+whole stage, as the eval does it. There's no reranker, generator or judge. The Gemma
+prompts are `task: search result | query: ` (search) or `task: question answering | query: `
+(qa) on queries, and `title: none | text: ` (none) or `title: {title} | text: ` (title) on
+documents.
+
+`ms_docs` (the contextual table):
+
+| variant | hit@dense | mrr@dense | hit@fused | mrr@fused | mrr@fused top 5 |
+|---|---|---|---|---|---|
+| te3s 1536 | 0.871 | 0.793 | 0.919 | 0.810 | 0.800 |
+| g768 search none | 0.874 | 0.760 | 0.933 | 0.763 | 0.755 |
+| g768 search title | 0.846 | 0.755 | 0.928 | 0.779 | 0.770 |
+| **g768 qa none** | 0.878 | 0.757 | 0.937 | 0.788 | 0.780 |
+| g768 qa title | 0.850 | 0.751 | 0.933 | 0.765 | 0.757 |
+| g512 search none | 0.866 | 0.740 | 0.933 | 0.758 | 0.751 |
+| g512 search title | 0.846 | 0.746 | 0.928 | 0.732 | 0.721 |
+| g512 qa none | 0.874 | 0.743 | 0.933 | 0.775 | 0.768 |
+| g512 qa title | 0.846 | 0.753 | 0.928 | 0.783 | 0.772 |
+
+`baseline` (plain chunks, no situating context):
+
+| variant | hit@dense | mrr@dense | hit@fused | mrr@fused | mrr@fused top 5 |
+|---|---|---|---|---|---|
+| te3s 1536 | 0.938 | 0.760 | 0.966 | 0.779 | 0.769 |
+| g768 search none | 0.855 | 0.695 | 0.899 | 0.754 | 0.742 |
+| g768 search title | 0.865* | 0.711 | 0.922 | 0.779 | 0.768 |
+| **g768 qa none** | 0.876 | 0.713 | 0.903 | 0.803 | 0.799 |
+| g768 qa title | 0.871 | 0.699 | 0.927 | 0.779 | 0.766 |
+| g512 search none | 0.863 | 0.716 | 0.899 | 0.789 | 0.782 |
+| g512 search title | 0.857* | 0.712 | 0.922 | 0.755 | 0.745 |
+| g512 qa none | 0.845 | 0.690 | 0.903 | 0.777 | 0.769 |
+| g512 qa title | 0.876 | 0.713 | 0.927 | 0.782 | 0.767 |
+
+`*` = paired randomization test vs te3s, p < 0.05.
+
+Recommended: **768 dims, `question answering` query prompt, `title: none`**. The
+differences are mostly inside the noise, but they point one way:
+
+- **768 over 512:** 768 is ahead in nearly every cell, though never measurably. At 8k
+  rows per table the storage saving is irrelevant.
+- **qa over search:** fused MRR is higher in both tables (0.788 vs 0.763, 0.803 vs 0.754).
+  Caveat: every test item is a question, so this may flatter `qa` on question-shaped traffic.
+- **No title:** titles don't help, and on `ms_docs` they cost ~0.03 dense hit. The
+  situating context already starts with a title breadcrumb, so the title is repeated.
+
+How big is the regression, g768 qa none vs te3s (paired differences, 95% bootstrap):
+
+- `ms_docs`: no measurable difference. hit@fused +0.018 [-0.025, +0.079],
+  mrr@fused -0.022 [-0.108, +0.064], mrr@dense -0.036 [-0.137, +0.062]. 3 questions
+  gained, 2 lost.
+- `baseline`: **hit@fused -0.062 [-0.140, -0.008]**, which is 4 questions lost and none
+  gained. The bootstrap interval excludes zero, though the randomization test doesn't
+  (p = 0.13). mrr@fused +0.025 [-0.047, +0.098]. Without the situating context, Gemma's
+  dense leg finds fewer gold pages than text-embedding-3-small. The rerank only sees
+  `fused`, so the `baseline` mode will probably lose a little after the switch.
+
+The next full eval after `ingest --replace` is what counts. This only checks the first
+stage.
+
 ## 2026-10-25: the rerank modes on the Spark reranker (#40)
 
 `contextual`, `baseline` and `raptor_sac` are back, reranked by
