@@ -44,6 +44,8 @@ def _base_env(monkeypatch):
     monkeypatch.delenv("OFFLINE_JUDGE_MODEL", raising=False)
     monkeypatch.delenv("GRAPH_QUERY_ROUTING", raising=False)
     monkeypatch.delenv("RAG_DATABASE_URL", raising=False)
+    for k in ("EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
 
 
 def test_judge_models_parsed_from_env(monkeypatch):
@@ -168,3 +170,34 @@ def test_rerank_modes_stay_offline_when_the_probe_fails(monkeypatch):
     monkeypatch.setenv("RERANKER_URL", "http://spark:8100")
     monkeypatch.setattr(cross_encoder, "_probe", lambda *a: False)
     assert unavailable_reason("baseline") == "reranker-offline"
+
+
+def test_embedding_defaults_to_the_foundry_model_at_1536(monkeypatch):
+    # Existing deployments set only FOUNDRY_EMBEDDING_MODEL and must keep working.
+    _base_env(monkeypatch)
+    e = Settings.from_env(load=False).embedding
+    assert (e.model, e.dimensions, e.base_url, e.api_key) == (
+        "text-embedding-3-small", 1536, None, None
+    )
+
+
+def test_embedding_is_one_setting_for_an_openai_compatible_server(monkeypatch):
+    # The Spark switch (issue #45) is env only.
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_MODEL", "nvidia/nemotron-embed")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "1024")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://spark:8102/v1")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+    s = Settings.from_env(load=False)
+    assert s.embedding.model == "nvidia/nemotron-embed"
+    assert s.embedding.dimensions == 1024
+    assert s.embedding.base_url == "http://spark:8102/v1"
+    # RAGAS answer_relevancy stays on the Foundry deployment.
+    assert s.foundry_embedding_model == "text-embedding-3-small"
+
+
+def test_embedding_dimensions_must_be_positive(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "0")
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        Settings.from_env(load=False)

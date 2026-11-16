@@ -5,7 +5,6 @@ requires-python = ">=3.11"
 dependencies = [
     "agent-framework",
     "agent-framework-foundry",
-    "azure-search-documents>=11.5.0",
     "azure-ai-projects>=2.0.0",
     "azure-identity",
     # Pinned exact: RAGAS metric prompts/APIs change across versions and legacy
@@ -33,9 +32,8 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio", "pytest-mock", "ruff", "matplotlib"]
 
 [tool.uv]
-# agent-framework currently ships only pre-release (beta) builds, and
-# azure-search-documents pulls a pre-release marker; allow them so `uv sync`
-# / `uv lock` resolve without needing --prerelease=allow on the CLI.
+# agent-framework currently ships only pre-release (beta) builds; allow them so
+# `uv sync` / `uv lock` resolve without needing --prerelease=allow on the CLI.
 prerelease = "allow"
 
 [tool.pytest.ini_options]

@@ -33,7 +33,7 @@ param offlineJudgeModelVersion string = '2026-04-23'
 @description('Embedding model deployment name. Deployed as GlobalStandard: text-embedding-3-small has no regional-Standard availability in swedencentral (that limitation is what previously forced switzerlandnorth).')
 param embeddingModel string = 'text-embedding-3-small'
 
-@description('Object (principal) ID to grant data-plane access to the Foundry models and the Search index. With azd this is auto-populated from AZURE_PRINCIPAL_ID (the deploying user or CI service principal). Leave empty to skip role assignments (e.g. when assigning them out of band).')
+@description('Object (principal) ID to grant data-plane access to the Foundry models. With azd this is auto-populated from AZURE_PRINCIPAL_ID (the deploying user or CI service principal). Leave empty to skip role assignments (e.g. when assigning them out of band).')
 param principalId string = ''
 
 @description('Type of the principal receiving the role assignments: User for a developer running azd locally, ServicePrincipal for CI / managed identity.')
@@ -49,27 +49,9 @@ param principalType string = 'User'
 // model is an Azure OpenAI deployment, served only on `/openai` (not the `/models`
 // inference route), so this role is sufficient — no Cognitive Services User role needed.
 var cognitiveServicesOpenAIUserRoleId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
-var searchServiceContributorRoleId = '7ca78c08-252a-4471-8644-bb5ff32d4ba0'
-var searchIndexDataContributorRoleId = '8ebe5a00-799e-43f5-93ac-243d3dce84a7'
 
-resource search 'Microsoft.Search/searchServices@2024-06-01-preview' = {
-  name: '${baseName}-search'
-  location: location
-  sku: { name: 'standard' }
-  properties: {
-    semanticSearch: 'standard'
-    replicaCount: 1
-    partitionCount: 1
-    // Accept Microsoft Entra tokens (RBAC) as well as API keys. Without this the
-    // service is apiKeyOnly and rejects our DefaultAzureCredential auth with 403.
-    disableLocalAuth: false
-    authOptions: {
-      aadOrApiKey: {
-        aadAuthFailureMode: 'http401WithBearerChallenge'
-      }
-    }
-  }
-}
+// No Azure AI Search: retrieval and ingest both use pgvector in homelab's Postgres
+// (ADR-0021, issue #45). ragpipe-search was deleted on 2026-11-16.
 
 resource foundry 'Microsoft.CognitiveServices/accounts@2025-04-01-preview' = {
   name: '${baseName}-foundry'
@@ -155,8 +137,8 @@ resource offlineJudge 'Microsoft.CognitiveServices/accounts/deployments@2025-04-
 
 // --- Data-plane RBAC for the deploying principal -------------------------------
 // Control-plane Owner does NOT grant data-plane access. These assignments let the
-// principal call the embedding/chat deployments and read/write the Search index,
-// which the post-provision ingestion + agent-registration steps require.
+// principal call the embedding/chat deployments, which the post-provision
+// ingestion + agent-registration steps require.
 
 resource openAIUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(principalId)) {
   name: guid(foundry.id, principalId, cognitiveServicesOpenAIUserRoleId)
@@ -168,28 +150,7 @@ resource openAIUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 }
 
-resource searchServiceContributorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(principalId)) {
-  name: guid(search.id, principalId, searchServiceContributorRoleId)
-  scope: search
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', searchServiceContributorRoleId)
-    principalId: principalId
-    principalType: principalType
-  }
-}
-
-resource searchIndexDataContributorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(principalId)) {
-  name: guid(search.id, principalId, searchIndexDataContributorRoleId)
-  scope: search
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', searchIndexDataContributorRoleId)
-    principalId: principalId
-    principalType: principalType
-  }
-}
-
 output FOUNDRY_PROJECT_ENDPOINT string = 'https://${foundry.name}.services.ai.azure.com/api/projects/${project.name}'
-output SEARCH_ENDPOINT string = 'https://${search.name}.search.windows.net'
 output FOUNDRY_CHAT_MODEL string = chatModel
 output FOUNDRY_EMBEDDING_MODEL string = embeddingModel
 output JUDGE_MODEL string = judgeModel

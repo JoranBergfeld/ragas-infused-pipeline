@@ -53,6 +53,10 @@ RERANK_MODES: frozenset[RetrievalMode] = frozenset(
     {RetrievalMode.CONTEXTUAL, RetrievalMode.BASELINE, RetrievalMode.RAPTOR_SAC}
 )
 RERANKER_OFFLINE = "reranker-offline"
+# The tables were embedded with another model than the service queries with
+# (issue #45): every mode is refused until serving's EMBEDDING_* matches or the
+# tables are re-ingested.
+EMBEDDING_MISMATCH = "embedding-mismatch"
 
 
 def unavailable_reason(mode: "RetrievalMode | str") -> str | None:
@@ -71,6 +75,27 @@ class ModeUnavailable(RuntimeError):
         self.mode = RetrievalMode(mode).value
         self.reason = reason
         super().__init__(f"mode {self.mode!r} is unavailable: {reason}")
+
+
+@dataclass(frozen=True)
+class EmbeddingSpec:
+    """The one embedding model that ingest writes and serving queries with.
+
+    Vectors from two models don't compare, so both sides read this from the same
+    env (ADR-0021, issue #45). ``base_url`` unset: the Foundry account's Azure OpenAI
+    route with Entra auth. Set: any OpenAI-compatible ``/v1/embeddings`` server (e.g.
+    vLLM on the Spark), with ``api_key`` as a bearer token. Switching model is a
+    config change plus ``python -m ragpipe.ingest <builder> --replace``.
+    """
+
+    model: str
+    dimensions: int = 1536
+    base_url: str | None = None
+    api_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.dimensions < 1:
+            raise ValueError(f"EMBEDDING_DIMENSIONS must be >= 1, got {self.dimensions}")
 
 
 def _require(name: str) -> str:
@@ -117,6 +142,21 @@ class Settings:
     agentic_max_iterations: int = 3
     raptor_max_levels: int = 3
     graph_community_levels: int = 1
+    # Retrieval embedding (ingest + serving). None: same as foundry_embedding_model,
+    # which stays the RAGAS answer_relevancy embedding either way.
+    embedding_model: str | None = None
+    embedding_dimensions: int = 1536
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
+
+    @property
+    def embedding(self) -> EmbeddingSpec:
+        return EmbeddingSpec(
+            model=self.embedding_model or self.foundry_embedding_model,
+            dimensions=self.embedding_dimensions,
+            base_url=self.embedding_base_url,
+            api_key=self.embedding_api_key,
+        )
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.faithfulness_threshold <= 1.0):
@@ -130,6 +170,10 @@ class Settings:
         if self.candidate_pool < self.top_k:
             raise ValueError(
                 f"CANDIDATE_POOL ({self.candidate_pool}) must be >= TOP_K ({self.top_k})"
+            )
+        if self.embedding_dimensions < 1:
+            raise ValueError(
+                f"EMBEDDING_DIMENSIONS must be >= 1, got {self.embedding_dimensions}"
             )
 
     @classmethod
@@ -158,4 +202,8 @@ class Settings:
             agentic_max_iterations=int(os.environ.get("AGENTIC_MAX_ITERATIONS", "3")),
             raptor_max_levels=int(os.environ.get("RAPTOR_MAX_LEVELS", "3")),
             graph_community_levels=int(os.environ.get("GRAPH_COMMUNITY_LEVELS", "1")),
+            embedding_model=os.environ.get("EMBEDDING_MODEL") or None,
+            embedding_dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1536")),
+            embedding_base_url=os.environ.get("EMBEDDING_BASE_URL") or None,
+            embedding_api_key=os.environ.get("EMBEDDING_API_KEY") or None,
         )

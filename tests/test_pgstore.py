@@ -13,9 +13,14 @@ import os
 
 import pytest
 
+from ragpipe.config import EmbeddingSpec
 from ragpipe.pg_import import import_table
+from ragpipe.pg_write import (
+    EmbeddingMismatch,
+    recorded_mismatch,
+    write_table,
+)
 from ragpipe.pgstore import (
-    EMBEDDING_DIMENSIONS,
     GRAPH_RELATIONSHIPS,
     MS_DOCS,
     SCHEMA,
@@ -26,9 +31,12 @@ from ragpipe.pgstore import (
 URL = os.environ.get("RAG_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="RAG_TEST_DATABASE_URL not set")
 
+DIMS = 1536
+EMB = EmbeddingSpec(model="test-embed", dimensions=DIMS)
+
 
 def _unit(i: int) -> list[float]:
-    v = [0.0] * EMBEDDING_DIMENSIONS
+    v = [0.0] * DIMS
     v[i] = 1.0
     return v
 
@@ -84,33 +92,33 @@ def test_import_is_rerunnable_and_never_doubles_rows(conn):
         calls.append(len(texts))
         return _embed_by_index(texts)
 
-    first = import_table(conn, MS_DOCS, DOCS, embed, log=_quiet)
+    first = import_table(conn, MS_DOCS, DOCS, embed, EMB, log=_quiet)
     assert (first.rows, first.inserted, first.deleted) == (4, 4, 0)
 
     # Same export again: nothing loaded, nothing embedded.
-    second = import_table(conn, MS_DOCS, DOCS, embed, log=_quiet)
+    second = import_table(conn, MS_DOCS, DOCS, embed, EMB, log=_quiet)
     assert (second.rows, second.inserted, second.deleted) == (4, 0, 0)
     assert calls == [4]
 
     # A row the export no longer has goes; the table converges on the export.
-    third = import_table(conn, MS_DOCS, DOCS[:3], embed, log=_quiet)
+    third = import_table(conn, MS_DOCS, DOCS[:3], embed, EMB, log=_quiet)
     assert (third.rows, third.inserted, third.deleted) == (3, 0, 1)
 
 
 def test_replace_reloads_everything(conn):
-    import_table(conn, MS_DOCS, DOCS, _embed_by_index, log=_quiet)
-    again = import_table(conn, MS_DOCS, DOCS, _embed_by_index, replace=True, log=_quiet)
+    import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, log=_quiet)
+    again = import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, replace=True, log=_quiet)
     assert (again.rows, again.inserted) == (4, 4)
 
 
 def test_ddl_is_idempotent(conn):
     for _ in range(2):
-        for stmt in create_table_sql(MS_DOCS):
+        for stmt in create_table_sql(MS_DOCS, DIMS):
             conn.execute(stmt)
 
 
 def test_nearest_orders_by_cosine_similarity(conn, pool):
-    import_table(conn, MS_DOCS, DOCS, _embed_by_index, log=_quiet)
+    import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, log=_quiet)
     rows = PgTable(pool, MS_DOCS).nearest(_unit(2), k=2)
     assert rows[0]["id"] == "c2"
     assert rows[0]["score"] == pytest.approx(1.0)
@@ -118,7 +126,7 @@ def test_nearest_orders_by_cosine_similarity(conn, pool):
 
 
 def test_bm25_prefers_the_rarer_term_and_skips_non_matches(conn, pool):
-    import_table(conn, MS_DOCS, DOCS, _embed_by_index, log=_quiet)
+    import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, log=_quiet)
     table = PgTable(pool, MS_DOCS)
 
     # "durable" is in one chunk, "functions" in two: the rare term decides.
@@ -134,7 +142,7 @@ def test_bm25_prefers_the_rarer_term_and_skips_non_matches(conn, pool):
 
 
 def test_page_and_sample(conn, pool):
-    import_table(conn, MS_DOCS, DOCS, _embed_by_index, log=_quiet)
+    import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, log=_quiet)
     table = PgTable(pool, MS_DOCS)
     assert [r["chunk_id"] for r in table.page("https://x/page")] == [0, 1, 2]
     assert [r["id"] for r in table.sample(2)] == ["c0", "c1"]
@@ -147,7 +155,7 @@ def test_relationships_load_without_vectors_and_scan(conn, pool):
     def no_embedding(texts):
         raise AssertionError("relationships aren't embedded")
 
-    import_table(conn, GRAPH_RELATIONSHIPS, rels, no_embedding, log=_quiet)
+    import_table(conn, GRAPH_RELATIONSHIPS, rels, no_embedding, EMB, log=_quiet)
     assert PgTable(pool, GRAPH_RELATIONSHIPS).scan() == [
         {"id": "rel-1", "source": "A", "target": "B", "description": "a uses b",
          "weight": 9.0, "source_urls": ["https://x/a"]}
@@ -157,7 +165,71 @@ def test_relationships_load_without_vectors_and_scan(conn, pool):
 def test_the_service_pool_cannot_write(conn, pool):
     import psycopg
 
-    import_table(conn, MS_DOCS, DOCS, _embed_by_index, log=_quiet)
+    import_table(conn, MS_DOCS, DOCS, _embed_by_index, EMB, log=_quiet)
     with pool.connection() as c:
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             c.execute(f"DELETE FROM {MS_DOCS.qualified}")
+
+
+# --- ingest's writer (issue #45) -------------------------------------------------
+
+
+def _with_vectors(docs: list[dict]) -> list[dict]:
+    return [{**d, "embedding": _unit(i)} for i, d in enumerate(docs)]
+
+
+def test_write_upserts_by_id_and_prunes_the_rest(conn, pool):
+    first = write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    assert (first.rows, first.written, first.pruned) == (4, 4, 0)
+
+    # A re-crawl: c0's text changed, c3 is gone. Same ids overwrite, no doubles.
+    changed = [{**DOCS[0], "content": "Azure Functions now runs durable timers."}, *DOCS[1:3]]
+    second = write_table(conn, MS_DOCS, _with_vectors(changed), EMB, log=_quiet)
+    assert (second.rows, second.pruned) == (3, 1)
+
+    table = PgTable(pool, MS_DOCS)
+    assert [r["content"] for r in table.page("https://x/page")][0].endswith("durable timers.")
+    # BM25 sees the new text: doc_len and tsv were recomputed on overwrite.
+    assert [r["id"] for r in table.bm25("timers", k=5)] == ["c0"]
+
+
+def test_a_limited_write_does_not_prune(conn):
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    partial = write_table(conn, MS_DOCS, _with_vectors(DOCS[:1]), EMB, prune=False, log=_quiet)
+    assert (partial.rows, partial.pruned) == (4, 0)
+
+
+def test_another_model_is_refused_until_replace(conn):
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    other = EmbeddingSpec(model="nemotron-embed", dimensions=DIMS)
+    with pytest.raises(EmbeddingMismatch, match="embedded with test-embed"):
+        write_table(conn, MS_DOCS, _with_vectors(DOCS), other, log=_quiet)
+    assert recorded_mismatch(conn, other) is not None
+    assert recorded_mismatch(conn, EMB) is None
+
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), other, replace=True, log=_quiet)
+    assert recorded_mismatch(conn, other) is None
+
+
+def test_another_dimension_is_refused_and_replace_resizes_the_column(conn):
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    small = EmbeddingSpec(model="test-embed", dimensions=8)
+    rows = [{**d, "embedding": [1.0] + [0.0] * 7} for d in DOCS]
+    with pytest.raises(EmbeddingMismatch, match=r"vector\(1536\)"):
+        write_table(conn, MS_DOCS, rows, small, log=_quiet)
+
+    write_table(conn, MS_DOCS, rows, small, replace=True, log=_quiet)
+    typmod = conn.execute(
+        "SELECT atttypmod FROM pg_attribute WHERE attrelid = 'rag.ms_docs'::regclass "
+        "AND attname = 'embedding'"
+    ).fetchone()[0]
+    assert typmod == 8
+
+
+def test_a_table_without_a_record_is_claimed_by_the_current_model(conn):
+    # Tables filled before records existed (the 2026-10-24 import) have none.
+    for stmt in create_table_sql(MS_DOCS, DIMS):
+        conn.execute(stmt)
+    assert recorded_mismatch(conn, EMB) is None
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    assert recorded_mismatch(conn, EmbeddingSpec(model="other", dimensions=DIMS))

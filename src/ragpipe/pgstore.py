@@ -3,15 +3,17 @@
 One table per former Azure AI Search index, in the ``rag`` schema. Each table
 keeps the index's fields as columns, plus:
 
-- ``embedding vector(1536)``: what the index's ``*_vector`` field held, cosine
-  k-NN through an HNSW index. ``graph_relationships`` has none: nothing queries
-  its vectors, ``build_adjacency`` only reads the text.
+- ``embedding vector(N)``: N is ``EMBEDDING_DIMENSIONS`` (the shared embedding
+  setting, ``config.EmbeddingSpec``); cosine k-NN through an HNSW index.
+  ``graph_relationships`` has none: nothing queries its vectors,
+  ``build_adjacency`` only reads the text.
 - ``tsv``: a generated ``tsvector`` over the fields Azure marked searchable, and
   ``doc_len``, its total term count. Together they feed a hand-rolled BM25.
   ``ts_rank`` has no IDF, and the BM25 extension wants Postgres 17.
 
 The service connects read-only (``default_transaction_read_only=on``) as a
-reader login; only the import (``ragpipe.pg_import``) writes, as the owner.
+reader login; only ingest and the export import write, as the owner, through
+``ragpipe.pg_write``.
 """
 from __future__ import annotations
 
@@ -20,7 +22,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 SCHEMA = "rag"
-EMBEDDING_DIMENSIONS = 1536
 TEXT_SEARCH_CONFIG = "english"
 # Azure AI Search's BM25 defaults, so the lexical leg is tuned like the old one.
 BM25_K1 = 1.2
@@ -35,8 +36,8 @@ class TableSpec:
     table: str
     columns: dict[str, str]
     searchable: tuple[str, ...] = ()
-    # Builds the embedding input from an exported row, the way ingest built it.
-    # None: the table has no vector column.
+    # The text a row's vector embeds. The one definition: ingest and the export
+    # import both embed through it (pg_write.embed_rows). None: no vector column.
     embed_input: Callable[[dict[str, Any]], str] | None = None
 
     @property
@@ -73,7 +74,12 @@ RAPTOR_SAC = TableSpec(
     table="raptor_sac",
     columns={**_CHUNK_COLUMNS, "level": "integer NOT NULL"},
     searchable=("title", "content", "context"),
-    embed_input=lambda row: row["content"],
+    # Leaves are SAC chunks, embedded like ms_docs (context, then chunk); summary
+    # nodes have no context and embed their text. Before #45 the import embedded
+    # leaves on content alone, unlike the ingest that built the index.
+    embed_input=lambda row: (
+        f"{row['context']}\n\n{row['content']}" if row["context"] else row["content"]
+    ),
 )
 GRAPH_ENTITIES = TableSpec(
     index="graph-entities",
@@ -125,7 +131,7 @@ TABLES: tuple[TableSpec, ...] = (
 )
 
 
-def create_table_sql(spec: TableSpec) -> list[str]:
+def create_table_sql(spec: TableSpec, dimensions: int) -> list[str]:
     """DDL for one table and its indexes. Idempotent, safe to run on every import.
 
     The HNSW index goes on before the load: building it after is faster, but a
@@ -133,7 +139,7 @@ def create_table_sql(spec: TableSpec) -> list[str]:
     """
     cols = [f"{name} {sql_type}" for name, sql_type in spec.columns.items()]
     if spec.embed_input is not None:
-        cols.append(f"embedding vector({EMBEDDING_DIMENSIONS}) NOT NULL")
+        cols.append(f"embedding vector({dimensions}) NOT NULL")
     if spec.searchable:
         joined = " || ' ' || ".join(f"coalesce({c}, '')" for c in spec.searchable)
         cols.append(

@@ -1,6 +1,9 @@
 # 0007 — In-place index updates with stale-document pruning
 
-**Status:** Accepted (backfilled; decided 2026-05-30, recorded 2026-06-10)
+**Status:** Accepted (backfilled; decided 2026-05-30, recorded 2026-06-10). The Azure
+index is gone. Since #45 the same upsert-then-prune contract runs on Postgres
+(`pg_write.write_table`, ADR-0021's 2026-11-16 amendment). There, an embedding-model change
+*can* drop and reload (`--replace`), because nothing binds to the tables.
 
 ## Context
 

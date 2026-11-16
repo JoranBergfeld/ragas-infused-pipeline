@@ -29,8 +29,12 @@ Three phases (see the diagram in `README.md` / `docs/pipeline*.svg`):
 
 1. **Ingest** (`ragpipe.ingest`): crawl Microsoft Learn → extract markdown → heading-aware
    chunk → decorate each chunk with a breadcrumb + cached LLM "situating context" → embed →
-   upload to Azure AI Search, then export → `ragpipe.pg_import` into Postgres (retrieval
-   reads Postgres only).
+   write the `rag` schema in homelab's Postgres directly (`ragpipe.pg_write`, as the owner
+   via `RAG_IMPORT_DATABASE_URL`; upsert + prune, `--replace` to drop and reload). There is
+   no Azure AI Search anymore (#45). The embedding model is **one setting**
+   (`Settings.embedding` / `EMBEDDING_*`) shared by ingest and serving. Each vector table
+   records its model in `rag.embedding_model`, and a mismatch is refused on both sides.
+   Never hard-code a model name or `vector(N)` size.
 2. **Query pipeline**: `app_wiring.build_pipeline_fn(settings, *, mode)` assembles a
    substrate + reranker (`build_reranker`: the Spark cross-encoder for `RERANK_MODES`,
    score-sort passthrough otherwise) + Foundry generator agent + RAGAS faithfulness judge into
@@ -94,7 +98,7 @@ required** everywhere: an omitted/unknown mode returns HTTP 422; there is no ser
 
 ## Provisioning & deploy
 
-`azd up` provisions Foundry/Search/model deployments via `infra/` Bicep, then the
+`azd up` provisions Foundry + model deployments via `infra/` Bicep (no Search), then the
 `postprovision` hook runs `ragpipe.ingest` + `scripts/setup_agents.py`. Default region is
 **swedencentral** (only region with Claude + gpt-5.4 + embeddings, ADR-0008). Pushes to
 `main` build the API container and publish it to GHCR (`.github/workflows/publish-image.yml`).
