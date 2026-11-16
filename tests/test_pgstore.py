@@ -202,7 +202,7 @@ def test_a_limited_write_does_not_prune(conn):
 def test_another_model_is_refused_until_replace(conn):
     write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
     other = EmbeddingSpec(model="nemotron-embed", dimensions=DIMS)
-    with pytest.raises(EmbeddingMismatch, match="embedded with test-embed"):
+    with pytest.raises(EmbeddingMismatch, match="embedded with model 'test-embed'"):
         write_table(conn, MS_DOCS, _with_vectors(DOCS), other, log=_quiet)
     assert recorded_mismatch(conn, other) is not None
     assert recorded_mismatch(conn, EMB) is None
@@ -233,3 +233,38 @@ def test_a_table_without_a_record_is_claimed_by_the_current_model(conn):
     assert recorded_mismatch(conn, EMB) is None
     write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
     assert recorded_mismatch(conn, EmbeddingSpec(model="other", dimensions=DIMS))
+
+
+def test_a_prompt_change_is_refused_like_a_model_change(conn):
+    gemma = EmbeddingSpec(
+        model="gemma", dimensions=DIMS,
+        query_prompt="task: search result | query: ", document_prompt="title: none | text: ",
+    )
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), gemma, log=_quiet)
+    assert recorded_mismatch(conn, gemma) is None
+
+    titled = EmbeddingSpec(**{**gemma.__dict__, "document_prompt": "title: {title} | text: "})
+    with pytest.raises(EmbeddingMismatch, match="document prompt"):
+        write_table(conn, MS_DOCS, _with_vectors(DOCS), titled, log=_quiet)
+    qa = EmbeddingSpec(**{**gemma.__dict__, "query_prompt": "task: question answering | query: "})
+    assert "query prompt" in recorded_mismatch(conn, qa)
+
+
+def test_a_record_table_from_before_the_prompts_is_migrated_and_still_read(conn, pool):
+    # The #46 shape: no prompt columns. Serving (read-only) must still compare it.
+    conn.execute(
+        "CREATE TABLE rag.embedding_model (table_name text PRIMARY KEY, model text NOT NULL, "
+        "dimensions integer NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())"
+    )
+    conn.execute("INSERT INTO rag.embedding_model VALUES ('ms_docs', 'test-embed', %s)", (DIMS,))
+    with pool.connection() as c:
+        assert recorded_mismatch(c, EMB) is None
+        gemma = EmbeddingSpec(model="test-embed", dimensions=DIMS, query_prompt="q: ")
+        assert "query prompt" in recorded_mismatch(c, gemma)
+    # The owner's next write adds the columns.
+    write_table(conn, MS_DOCS, _with_vectors(DOCS), EMB, log=_quiet)
+    cols = {r[0] for r in conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'rag' AND table_name = 'embedding_model'"
+    )}
+    assert {"query_prompt", "document_prompt"} <= cols

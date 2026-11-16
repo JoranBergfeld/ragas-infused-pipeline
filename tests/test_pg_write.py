@@ -7,6 +7,8 @@ import pytest
 from ragpipe.config import EmbeddingSpec
 from ragpipe.pg_write import (
     EmbeddingMismatch,
+    Recorded,
+    document_input,
     embed_rows,
     mismatch_reason,
     row_params,
@@ -38,7 +40,7 @@ def test_mismatch_reason_passes_a_new_or_unrecorded_table():
     assert mismatch_reason(MS_DOCS, EMB, column_dims=None, recorded=None) is None
     assert mismatch_reason(MS_DOCS, EMB, column_dims=1536, recorded=None) is None
     assert (
-        mismatch_reason(MS_DOCS, EMB, column_dims=1536, recorded=("text-embedding-3-small", 1536))
+        mismatch_reason(MS_DOCS, EMB, column_dims=1536, recorded=Recorded("text-embedding-3-small", 1536))
         is None
     )
 
@@ -48,7 +50,7 @@ def test_mismatch_reason_names_the_model_or_dimension_that_differs():
     assert "vector(1536)" in mismatch_reason(MS_DOCS, spark, column_dims=1536, recorded=None)
     same_dims = EmbeddingSpec(model="nemotron-embed", dimensions=1536)
     reason = mismatch_reason(
-        MS_DOCS, same_dims, column_dims=1536, recorded=("text-embedding-3-small", 1536)
+        MS_DOCS, same_dims, column_dims=1536, recorded=Recorded("text-embedding-3-small", 1536)
     )
     assert "text-embedding-3-small" in reason and "nemotron-embed" in reason
 
@@ -106,3 +108,51 @@ def test_embed_rows_leaves_tables_without_vectors_alone():
 
     rows = [{"id": "rel-0"}]
     assert embed_rows(GRAPH_RELATIONSHIPS, rows, boom) is rows
+
+
+GEMMA = EmbeddingSpec(
+    model="google/embeddinggemma-2",
+    dimensions=768,
+    base_url="http://spark:8103/v1",
+    query_prompt="task: search result | query: ",
+    document_prompt="title: none | text: ",
+)
+
+
+def test_a_prompt_change_is_a_mismatch_like_a_model_change():
+    rec = Recorded(GEMMA.model, 768, GEMMA.query_prompt, GEMMA.document_prompt)
+    assert mismatch_reason(MS_DOCS, GEMMA, column_dims=768, recorded=rec) is None
+
+    qa = EmbeddingSpec(**{**GEMMA.__dict__, "query_prompt": "task: question answering | query: "})
+    assert "query prompt" in mismatch_reason(MS_DOCS, qa, column_dims=768, recorded=rec)
+    titled = EmbeddingSpec(**{**GEMMA.__dict__, "document_prompt": "title: {title} | text: "})
+    assert "document prompt" in mismatch_reason(MS_DOCS, titled, column_dims=768, recorded=rec)
+
+
+def test_document_input_puts_the_document_prompt_before_the_tables_input():
+    assert document_input(MS_DOCS, _chunk(), GEMMA) == "title: none | text: T > H\n\nbody"
+    assert document_input(MS_DOCS, _chunk(), None) == "T > H\n\nbody"
+    assert document_input(MS_DOCS, _chunk(), EMB) == "T > H\n\nbody"  # text-embedding-3: none
+
+
+def test_title_placeholder_uses_the_rows_title_or_name_or_none():
+    titled = EmbeddingSpec(model="g", dimensions=768, document_prompt="title: {title} | text: ")
+    assert document_input(BASELINE, _chunk(context=""), titled) == "title: T | text: body"
+    from ragpipe.pgstore import GRAPH_ENTITIES
+
+    entity = {"id": "entity-0", "name": "AZURE FUNCTIONS", "description": "Serverless"}
+    assert document_input(GRAPH_ENTITIES, entity, titled) == "title: AZURE FUNCTIONS | text: Serverless"
+    assert titled.document_text("x", None) == "title: none | text: x"
+    assert titled.document_text("x", "  ") == "title: none | text: x"
+
+
+def test_query_text_adds_only_the_query_prompt():
+    assert GEMMA.query_text("how do I scale?") == "task: search result | query: how do I scale?"
+    assert EMB.query_text("how do I scale?") == "how do I scale?"
+
+
+def test_openai_compatible_servers_are_asked_for_the_configured_dimensions():
+    from ragpipe.embeddings import request_options
+
+    assert request_options(GEMMA) == {"dimensions": 768}
+    assert request_options(EMB) == {}  # Foundry route: unchanged
