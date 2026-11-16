@@ -84,3 +84,15 @@ def test_embed_in_chunks_clips_oversized_inputs_only():
 
     _embed_in_chunks(embed_one, ["x" * 50, "short"], max_inputs=5, max_chars=10)
     assert seen == ["x" * 10, "short"]
+
+
+def test_check_dimensions_names_the_model_and_both_sizes():
+    import pytest
+
+    from ragpipe.config import EmbeddingSpec
+    from ragpipe.embeddings import EmbeddingDimensionError, check_dimensions
+
+    spec = EmbeddingSpec(model="m", dimensions=3)
+    assert check_dimensions(spec, [[0.0] * 3]) == [[0.0] * 3]
+    with pytest.raises(EmbeddingDimensionError, match="m returned a 2-dim vector, EMBEDDING_DIMENSIONS is 3"):
+        check_dimensions(spec, [[0.0] * 3, [0.0] * 2])

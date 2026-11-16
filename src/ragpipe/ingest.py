@@ -1,3 +1,14 @@
+"""Ingest: crawl, extract, chunk, decorate, embed, write ``rag`` in Postgres.
+
+    uv run python -m ragpipe.ingest [contextual|baseline|raptor|graph] [LIMIT] [--replace]
+
+Each builder writes its table(s) straight into homelab's Postgres as the owner
+login (``RAG_IMPORT_DATABASE_URL``) through ``ragpipe.pg_write``: upsert by id,
+then prune ids the fresh corpus no longer has (ADR-0007), skipped on a LIMIT
+smoke run. Vectors come from the shared embedding setting (``EMBEDDING_*``,
+issue #45); a table filled by another model is refused until ``--replace``
+drops and reloads it, which is how an embedding-model switch is done.
+"""
 from __future__ import annotations
 
 import base64
@@ -12,6 +23,7 @@ from bs4 import BeautifulSoup
 
 from ragpipe.chunking import chunk_markdown
 from ragpipe.extraction import html_to_markdown
+from ragpipe.pg_write import embed_rows
 from ragpipe.pgstore import (
     BASELINE,
     GRAPH_COMMUNITIES,
@@ -19,17 +31,8 @@ from ragpipe.pgstore import (
     GRAPH_RELATIONSHIPS,
     MS_DOCS,
     RAPTOR_SAC,
+    TableSpec,
 )
-
-
-def _search_endpoint() -> str:  # pragma: no cover - env
-    """Ingest still writes Azure AI Search. Retrieval reads Postgres since #37
-    (ADR-0021), so a fresh ingest lands nowhere the pipeline looks until it's
-    exported and imported, or ingest learns to write Postgres itself."""
-    endpoint = os.environ.get("SEARCH_ENDPOINT")
-    if not endpoint:
-        raise SystemExit("ingest writes Azure AI Search: set SEARCH_ENDPOINT")
-    return endpoint
 
 
 def _doc_id(url: str, index: int) -> str:
@@ -46,14 +49,16 @@ def build_documents(
     overlap: int = 200,
     batch_size: int = 64,
     context_workers: int = 4,
+    spec: TableSpec = MS_DOCS,
 ) -> list[dict[str, Any]]:
-    """Turn fetched pages into decorated Azure AI Search documents.
+    """Turn fetched pages into decorated ``rag.ms_docs`` rows.
 
     Per chunk: `context` = breadcrumb + generated situating context (ADR-0001),
-    `content` = clean chunk text (ADR-0003), `content_vector` = embedding of
-    `context + "\\n\\n" + content`. Context generation runs on a small thread
-    pool (the callable is cache-backed and thread-safe); embedding stays
-    batched as before.
+    `content` = clean chunk text (ADR-0003), `embedding` = the vector of
+    ``MS_DOCS.embed_input`` (`context + "\\n\\n" + content`). Context generation
+    runs on a small thread pool (the callable is cache-backed and thread-safe);
+    embedding is batched. ``spec`` picks whose ``embed_input`` applies (RAPTOR's
+    leaves pass ``RAPTOR_SAC``).
     """
     metas: list[dict[str, Any]] = []
     chunks: list[Any] = []  # MarkdownChunk
@@ -81,30 +86,26 @@ def build_documents(
         c.breadcrumb + (f"\n{g}" if g else "") for c, g in zip(chunks, generated)
     ]
 
-    embed_inputs = [f"{ctx}\n\n{c.text}" for ctx, c in zip(contexts, chunks)]
-    print(f"Embedding {total} chunks in batches of {batch_size}…", flush=True)
-    vectors: list[list[float]] = []
-    for start in range(0, total, batch_size):
-        vectors.extend(embed_batch_fn(embed_inputs[start : start + batch_size]))
-        print(f"  embedded {min(start + batch_size, total)}/{total} chunks", flush=True)
-
-    return [
-        {**meta, "content": chunk.text, "context": ctx, "content_vector": vector}
-        for meta, chunk, ctx, vector in zip(metas, chunks, contexts, vectors)
+    rows = [
+        {**meta, "content": chunk.text, "context": ctx}
+        for meta, chunk, ctx in zip(metas, chunks, contexts)
     ]
+    print(f"Embedding {total} chunks in batches of {batch_size}…", flush=True)
+    return embed_rows(spec, rows, embed_batch_fn, batch_size=batch_size, log=_log)
 
 
 def build_baseline_documents(
     pages: list[dict[str, Any]],
-    embed_fn: Callable[[str], list[float]],
+    embed_batch_fn: Callable[[list[str]], list[list[float]]],
     max_chars: int = 2000,
     overlap: int = 200,
+    batch_size: int = 64,
 ) -> list[dict[str, Any]]:
-    """Build plain (no contextual decoration) documents for the baseline index.
+    """Build plain (no contextual decoration) rows for ``rag.baseline``.
 
     Mirrors build_documents field shapes but skips the ContextGenerator entirely:
     - ``context`` field is empty string
-    - ``content_vector`` embeds raw ``content`` only (not context + content)
+    - ``embedding`` embeds raw ``content`` only (``BASELINE.embed_input``)
     """
     docs: list[dict[str, Any]] = []
     for page in pages:
@@ -120,10 +121,9 @@ def build_baseline_documents(
                     "chunk_id": i,
                     "content": content,
                     "context": "",
-                    "content_vector": embed_fn(content),
                 }
             )
-    return docs
+    return embed_rows(BASELINE, docs, embed_batch_fn, batch_size=batch_size, log=_log)
 
 
 def fetch_pages(
@@ -189,115 +189,62 @@ def fetch_pages(
     return pages
 
 
-def _upload_batch_with_retry(
-    search_client: Any,
-    batch: list[dict[str, Any]],
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _write(
+    settings: Any,
+    spec: TableSpec,
+    rows: list[dict[str, Any]],
     *,
-    max_retries: int = 5,
-    sleep_fn: Callable[[float], None] = time.sleep,
-) -> None:
-    """Upload one batch, retrying transient failures with exponential backoff.
+    limit: int | None,
+    replace: bool,
+) -> None:  # pragma: no cover - needs a database
+    """Write one table's rows to Postgres. A ``limit`` smoke run doesn't prune:
+    against a partial fresh set that would empty the rest of the table."""
+    from ragpipe.pg_write import connect_owner, write_table
 
-    Azure Search uploads are idempotent upserts keyed on `id`, so re-sending a
-    whole batch after a transient error (e.g. ServiceResponseError 'write
-    operation timed out') is safe. Without this a single network blip mid-upload
-    aborts the entire build -- discarding an ~hour of extraction work.
-    """
-    for attempt in range(max_retries + 1):
-        try:
-            search_client.upload_documents(batch)
-            return
-        except Exception as exc:  # noqa: BLE001 - retry any transient upload error
-            if attempt == max_retries:
-                raise
-            delay = min(2 ** attempt, 30)
-            print(
-                f"  upload batch attempt {attempt} failed "
-                f"({type(exc).__name__}: {exc}); retrying in {delay}s",
-                file=sys.stderr,
-                flush=True,
-            )
-            sleep_fn(delay)
+    with connect_owner() as conn:
+        result = write_table(
+            conn, spec, rows, settings.embedding,
+            prune=limit is None, replace=replace, log=_log,
+        )
+    note = " (limit, prune skipped)" if limit is not None else f", pruned {result.pruned} stale"
+    print(
+        f"Wrote {result.written} rows to {spec.qualified}: {result.rows} in the table{note}.",
+        flush=True,
+    )
 
 
-def _upload_in_batches(
-    search_client: Any, docs: list[dict[str, Any]], batch_size: int = 500
-) -> None:  # pragma: no cover - network
-    for start in range(0, len(docs), batch_size):
-        batch = docs[start : start + batch_size]
-        _upload_batch_with_retry(search_client, batch)
-        print(f"  uploaded {min(start + batch_size, len(docs))}/{len(docs)} chunks", flush=True)
-
-
-def prune_stale_documents(
-    search_client: Any, fresh_ids: set[str], batch_size: int = 500
-) -> int:
-    """Delete indexed chunks whose id is not in the freshly-uploaded set.
-
-    Uploading is an upsert keyed on id, so re-ingesting a *changed* corpus
-    overwrites matching chunks but leaves orphans from a previous, larger corpus
-    behind (inflating the doc count and surfacing dead content). We can't just
-    recreate the index — a Foundry knowledge source binds to it — so instead we
-    enumerate current ids and delete the ones no longer present.
-
-    Safe under indexing lag: stale chunks are old and already searchable, and
-    fresh chunks are excluded by membership in `fresh_ids` even if their upload
-    hasn't become searchable yet.
-    """
-    existing = [doc["id"] for doc in search_client.search(search_text="*", select=["id"])]
-    stale = [doc_id for doc_id in existing if doc_id not in fresh_ids]
-    for start in range(0, len(stale), batch_size):
-        batch = [{"id": doc_id} for doc_id in stale[start : start + batch_size]]
-        search_client.delete_documents(batch)
-    return len(stale)
-
-
-def main(limit: int | None = None) -> None:  # pragma: no cover - integration entry point
+def _source_urls(limit: int | None) -> list[str]:  # pragma: no cover - file
     import yaml
-    from azure.identity import DefaultAzureCredential
-    from azure.search.documents import SearchClient
-    from azure.search.documents.indexes import SearchIndexClient
 
-    from ragpipe.config import Settings
-    from ragpipe.context_gen import ContextGenerator, build_context_complete_fn
-    from ragpipe.embeddings import build_batch_embed_fn
-    from ragpipe.search_index import create_index
-
-    settings = Settings.from_env()
     with open("data/corpus_sources.yaml") as f:
         urls = yaml.safe_load(f)["sources"]
-    if limit is not None:
-        urls = urls[:limit]
+    return urls[:limit] if limit is not None else urls
 
-    cred = DefaultAzureCredential()
+
+def build_contextual(
+    settings: Any, limit: int | None = None, replace: bool = False
+) -> None:  # pragma: no cover
+    """Ingest the decorated ``rag.ms_docs`` table (the contextual mode)."""
+    from ragpipe.context_gen import ContextGenerator, build_context_complete_fn
+    from ragpipe.embeddings import build_batch_embed_fn
+
     embed_batch = build_batch_embed_fn(settings)
     context_gen = ContextGenerator(
         build_context_complete_fn(settings), model=settings.foundry_chat_model
     )
-
-    pages = fetch_pages(urls)
+    pages = fetch_pages(_source_urls(limit))
     if not pages:
         raise SystemExit("No pages fetched; nothing to ingest.")
-
-    first_vec = embed_batch([pages[0]["markdown"][:100]])[0]
-    index_client = SearchIndexClient(_search_endpoint(), cred)
-    create_index(index_client, MS_DOCS.index, vector_dimensions=len(first_vec))
 
     docs = build_documents(pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate)
     if context_gen.fallback_count:
         print(f"  context fallbacks (breadcrumb-only): {context_gen.fallback_count}", flush=True)
-    search_client = SearchClient(_search_endpoint(), MS_DOCS.index, cred)
-    _upload_in_batches(search_client, docs)
-    if limit is not None:
-        # Partial ingest (smoke run): pruning against a partial fresh set would
-        # delete the rest of the index. Skip; the next full ingest reconverges.
-        print(f"Uploaded {len(docs)} chunks from {len(pages)} pages (limit={limit}, prune skipped).")
-        return
-    pruned = prune_stale_documents(search_client, fresh_ids={d["id"] for d in docs})
-    print(
-        f"Uploaded {len(docs)} chunks from {len(pages)} pages "
-        f"to index '{MS_DOCS.index}' (pruned {pruned} stale chunks)."
-    )
+    print(f"{len(docs)} chunks from {len(pages)} pages.", flush=True)
+    _write(settings, MS_DOCS, docs, limit=limit, replace=replace)
 
 
 def raptor_summary_documents(nodes: list[Any]) -> list[dict[str, Any]]:
@@ -315,38 +262,29 @@ def raptor_summary_documents(nodes: list[Any]) -> list[dict[str, Any]]:
             "chunk_id": 0,
             "content": node.text,
             "context": "",
-            "content_vector": node.embedding,
+            "embedding": node.embedding,
             "level": node.level,
         }
         for node in nodes
     ]
 
 
-def build_raptor(settings: Any, limit: int | None = None) -> None:  # pragma: no cover
-    """Ingest the RAPTOR SAC index: leaf docs with level=0 plus RAPTOR summary nodes.
+def build_raptor(
+    settings: Any, limit: int | None = None, replace: bool = False
+) -> None:  # pragma: no cover
+    """Ingest ``rag.raptor_sac``: SAC leaf rows with level=0 plus RAPTOR summary nodes.
 
-    Mirrors build_baseline but builds the full RAPTOR tree on top of the SAC
-    (situating-context + embedding) leaf docs and uploads both leaves and summaries
-    to RAPTOR_SAC.index with include_level=True.
+    Builds the full RAPTOR tree on top of the SAC (situating-context + embedding)
+    leaf rows and writes leaves and summaries to one table. Leaf vectors embed
+    context + content, summaries their text: ``RAPTOR_SAC.embed_input``.
     """
     import sys
-
-    import yaml
-    from azure.identity import DefaultAzureCredential
-    from azure.search.documents import SearchClient
-    from azure.search.documents.indexes import SearchIndexClient
 
     from ragpipe.context_gen import ContextGenerator, build_context_complete_fn
     from ragpipe.embeddings import build_batch_embed_fn
     from ragpipe.raptor import RaptorNode, build_raptor_tree, pack_passages
-    from ragpipe.search_index import build_index
 
-    with open("data/corpus_sources.yaml") as f:
-        urls = yaml.safe_load(f)["sources"]
-    if limit is not None:
-        urls = urls[:limit]
-
-    cred = DefaultAzureCredential()
+    urls = _source_urls(limit)
     embed_batch = build_batch_embed_fn(settings)
     context_gen = ContextGenerator(
         build_context_complete_fn(settings), model=settings.foundry_chat_model
@@ -356,8 +294,10 @@ def build_raptor(settings: Any, limit: int | None = None) -> None:  # pragma: no
     if not pages:
         raise SystemExit("No pages fetched; nothing to ingest.")
 
-    # 1. Build SAC leaf docs (same decoration as main())
-    leaf_docs = build_documents(pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate)
+    # 1. Build SAC leaf docs (same decoration as the contextual table)
+    leaf_docs = build_documents(
+        pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate, spec=RAPTOR_SAC
+    )
     if context_gen.fallback_count:
         print(f"  context fallbacks (breadcrumb-only): {context_gen.fallback_count}", flush=True)
     for d in leaf_docs:
@@ -365,7 +305,7 @@ def build_raptor(settings: Any, limit: int | None = None) -> None:  # pragma: no
 
     # 2. Wrap leaf docs as RaptorNode leaves
     leaves = [
-        RaptorNode(id=d["id"], text=d["content"], level=0, embedding=d["content_vector"])
+        RaptorNode(id=d["id"], text=d["content"], level=0, embedding=d["embedding"])
         for d in leaf_docs
     ]
 
@@ -404,88 +344,25 @@ def build_raptor(settings: Any, limit: int | None = None) -> None:  # pragma: no
     )
     print(f"  RAPTOR produced {len(summaries)} summary nodes.", flush=True)
 
-    # 5. Create/update the RAPTOR SAC index with include_level=True
-    dims = len(leaf_docs[0]["content_vector"])
-    index_client = SearchIndexClient(_search_endpoint(), cred)
-    index_client.create_or_update_index(
-        build_index(RAPTOR_SAC.index, dims, include_context=True, include_level=True)
-    )
-
-    # 6. Upload leaves + summaries; prune stale (skip on partial ingest)
+    # 5. Write leaves + summaries (prune skipped on a partial ingest).
     docs = leaf_docs + raptor_summary_documents(summaries)
-    search_client = SearchClient(_search_endpoint(), RAPTOR_SAC.index, cred)
-    _upload_in_batches(search_client, docs)
-
-    if limit is not None:
-        print(
-            f"Uploaded {len(leaf_docs)} leaves + {len(summaries)} summary nodes "
-            f"to index '{RAPTOR_SAC.index}' (limit={limit}, prune skipped).",
-            flush=True,
-        )
-        return
-
-    pruned = prune_stale_documents(search_client, fresh_ids={d["id"] for d in docs})
-    print(
-        f"Uploaded {len(leaf_docs)} leaves + {len(summaries)} summary nodes "
-        f"to index '{RAPTOR_SAC.index}' (pruned {pruned} stale).",
-        flush=True,
-    )
+    print(f"{len(leaf_docs)} leaves + {len(summaries)} summary nodes.", flush=True)
+    _write(settings, RAPTOR_SAC, docs, limit=limit, replace=replace)
 
 
-def build_baseline(settings: Any, limit: int | None = None) -> None:  # pragma: no cover
-    """Ingest the plain-chunk baseline index (no contextual decoration).
-
-    Mirrors main() but uses build_baseline_documents and targets
-    BASELINE.index with include_context=False.
-    """
-    import yaml
-    from azure.identity import DefaultAzureCredential
-    from azure.search.documents import SearchClient
-    from azure.search.documents.indexes import SearchIndexClient
-
+def build_baseline(
+    settings: Any, limit: int | None = None, replace: bool = False
+) -> None:  # pragma: no cover
+    """Ingest the plain-chunk ``rag.baseline`` table (no contextual decoration)."""
     from ragpipe.embeddings import build_batch_embed_fn
 
-    with open("data/corpus_sources.yaml") as f:
-        urls = yaml.safe_load(f)["sources"]
-    if limit is not None:
-        urls = urls[:limit]
-
-    cred = DefaultAzureCredential()
     embed_batch = build_batch_embed_fn(settings)
-
-    pages = fetch_pages(urls)
+    pages = fetch_pages(_source_urls(limit))
     if not pages:
         raise SystemExit("No pages fetched; nothing to ingest.")
-
-    first_vec = embed_batch([pages[0]["markdown"][:100]])[0]
-    dims = len(first_vec)
-
-    index_client = SearchIndexClient(_search_endpoint(), cred)
-    # Reuse create_index (which calls build_index internally) but we need
-    # include_context=False. create_index is a thin wrapper; call build_index
-    # directly and use create_or_update_index.
-    from ragpipe.search_index import build_index
-
-    index_client.create_or_update_index(
-        build_index(BASELINE.index, dims, include_context=False)
-    )
-
-    # Build docs: embed_fn takes a single string; wrap embed_batch for this.
-    def _embed_one(text: str) -> list[float]:
-        return embed_batch([text])[0]
-
-    docs = build_baseline_documents(pages, embed_fn=_embed_one)
-
-    search_client = SearchClient(_search_endpoint(), BASELINE.index, cred)
-    _upload_in_batches(search_client, docs)
-    if limit is not None:
-        print(f"Uploaded {len(docs)} chunks from {len(pages)} pages (limit={limit}, prune skipped).")
-        return
-    pruned = prune_stale_documents(search_client, fresh_ids={d["id"] for d in docs})
-    print(
-        f"Uploaded {len(docs)} chunks from {len(pages)} pages "
-        f"to index '{BASELINE.index}' (pruned {pruned} stale chunks)."
-    )
+    docs = build_baseline_documents(pages, embed_batch_fn=embed_batch)
+    print(f"{len(docs)} chunks from {len(pages)} pages.", flush=True)
+    _write(settings, BASELINE, docs, limit=limit, replace=replace)
 
 
 def _graph_extract_workers(value: int | None = None) -> int:
@@ -507,67 +384,55 @@ def _finish_graph(
     relationships: list[Any],
     communities: list[Any],
     community_map: dict[str, int],
+    *,
+    limit: int | None,
+    replace: bool,
 ) -> None:  # pragma: no cover - network
-    """Embed entity/relationship/community descriptions and upload them to the
-    three graph indexes. Shared by both build_graph paths (fresh extraction and
-    cache-resume) so the embed/upload tail lives in exactly one place."""
-    from azure.identity import DefaultAzureCredential
-    from azure.search.documents import SearchClient
-    from azure.search.documents.indexes import SearchIndexClient
-
+    """Embed entity and community descriptions and write the three graph tables.
+    Shared by both build_graph paths (fresh extraction and cache-resume) so the
+    embed/write tail lives in exactly one place. Relationships aren't embedded:
+    nothing queries their vectors (ADR-0021)."""
     from ragpipe.embeddings import build_batch_embed_fn
     from ragpipe.graphrag import (
         community_documents,
         entity_documents,
         relationship_documents,
     )
-    from ragpipe.search_index import (
-        build_communities_index,
-        build_entities_index,
-        build_relationships_index,
-    )
 
-    cred = DefaultAzureCredential()
     embed_batch = build_batch_embed_fn(settings)
+    # build_batch_embed_fn splits each call into small requests, so a big batch
+    # here can't blow the per-request array cap or the TPM limit.
+    ent_docs = embed_rows(
+        GRAPH_ENTITIES, entity_documents(entities, community=community_map), embed_batch,
+        batch_size=2048, log=_log,
+    )
+    com_docs = embed_rows(
+        GRAPH_COMMUNITIES, community_documents(communities), embed_batch,
+        batch_size=2048, log=_log,
+    )
+    rel_docs = relationship_documents(relationships)
 
-    # Build docs for all three indexes (embedding happens here, internally
-    # chunked by build_batch_embed_fn so the input array can't blow the TPM cap).
-    ent_docs = entity_documents(entities, community=community_map, embed_batch_fn=embed_batch)
-    rel_docs = relationship_documents(relationships, embed_batch_fn=embed_batch)
-    com_docs = community_documents(communities, embed_batch_fn=embed_batch)
-
-    # Create the three indexes.
-    dims = len(ent_docs[0]["description_vector"])
-    index_client = SearchIndexClient(_search_endpoint(), cred)
-    index_client.create_or_update_index(build_entities_index(GRAPH_ENTITIES.index, dims))
-    index_client.create_or_update_index(build_relationships_index(GRAPH_RELATIONSHIPS.index, dims))
-    index_client.create_or_update_index(build_communities_index(GRAPH_COMMUNITIES.index, dims))
-
-    # Upload each doc set (batched + retried inside _upload_in_batches).
-    ent_client = SearchClient(_search_endpoint(), GRAPH_ENTITIES.index, cred)
-    rel_client = SearchClient(_search_endpoint(), GRAPH_RELATIONSHIPS.index, cred)
-    com_client = SearchClient(_search_endpoint(), GRAPH_COMMUNITIES.index, cred)
-
-    print(f"Uploading {len(ent_docs)} entity docs to '{GRAPH_ENTITIES.index}'…", flush=True)
-    _upload_in_batches(ent_client, ent_docs)
-    print(f"Uploading {len(rel_docs)} relationship docs to '{GRAPH_RELATIONSHIPS.index}'…", flush=True)
-    _upload_in_batches(rel_client, rel_docs)
-    print(f"Uploading {len(com_docs)} community docs to '{GRAPH_COMMUNITIES.index}'…", flush=True)
-    _upload_in_batches(com_client, com_docs)
+    for spec, docs in (
+        (GRAPH_ENTITIES, ent_docs),
+        (GRAPH_RELATIONSHIPS, rel_docs),
+        (GRAPH_COMMUNITIES, com_docs),
+    ):
+        _write(settings, spec, docs, limit=limit, replace=replace)
 
     print(
         f"build_graph done: {len(entities)} entities, {len(relationships)} relationships, "
-        f"{len(communities)} communities → indexes "
-        f"'{GRAPH_ENTITIES.index}', '{GRAPH_RELATIONSHIPS.index}', "
-        f"'{GRAPH_COMMUNITIES.index}'.",
+        f"{len(communities)} communities.",
         flush=True,
     )
 
 
 def build_graph(
-    settings: Any, limit: int | None = None, extract_workers: int | None = None
+    settings: Any,
+    limit: int | None = None,
+    replace: bool = False,
+    extract_workers: int | None = None,
 ) -> None:  # pragma: no cover
-    """Ingest the GraphRAG indexes: entities, relationships, and communities.
+    """Ingest the GraphRAG tables: entities, relationships, and communities.
 
     Steps:
     1. Fetch pages; chunk into SAC leaf docs (same decoration as main).
@@ -575,7 +440,7 @@ def build_graph(
        delimited format parse_extraction expects.
     3. Merge entities, detect communities (Louvain), produce Community objects
        with an LLM-written title + summary per community.
-    4. Embed and upload to three separate Azure AI Search indexes.
+    4. Embed and write the three ``rag.graph_*`` tables.
 
     Community reports: LLM-generated (title + summary) per community -- NOT a
     shortcut. A separate chat completion writes a short report over the member
@@ -584,8 +449,6 @@ def build_graph(
     extract_workers = _graph_extract_workers(extract_workers)
 
     import sys
-
-    import yaml
 
     from ragpipe.context_gen import ContextGenerator, build_context_complete_fn
     from ragpipe.embeddings import build_batch_embed_fn
@@ -599,11 +462,7 @@ def build_graph(
         save_graph_state,
     )
 
-    with open("data/corpus_sources.yaml") as f:
-        urls = yaml.safe_load(f)["sources"]
-    if limit is not None:
-        urls = urls[:limit]
-
+    urls = _source_urls(limit)
     cache_path = os.environ.get("RAGPIPE_GRAPH_CACHE", ".graph_cache.json")
     cached = load_graph_state(cache_path, limit=limit)
     if cached is not None:
@@ -614,7 +473,10 @@ def build_graph(
             f"(skipping extraction).",
             flush=True,
         )
-        _finish_graph(settings, entities, relationships, communities, community_map)
+        _finish_graph(
+            settings, entities, relationships, communities, community_map,
+            limit=limit, replace=replace,
+        )
         return
 
     embed_batch = build_batch_embed_fn(settings)
@@ -791,48 +653,79 @@ def build_graph(
             flush=True,
         )
 
-    _finish_graph(settings, entities, relationships, communities, community_map)
+    _finish_graph(
+        settings, entities, relationships, communities, community_map,
+        limit=limit, replace=replace,
+    )
 
 
-# Substrate builders dispatchable from the CLI. main() (contextual) is handled
-# separately because it builds its own Settings; these take (settings, limit).
-_BUILDERS: dict[str, Callable[[Any, int | None], None]] = {
+# Builders dispatchable from the CLI, each taking (settings, limit, replace).
+_BUILDERS: dict[str, Callable[..., None]] = {
+    "contextual": build_contextual,
     "baseline": build_baseline,
     "raptor": build_raptor,
     "graph": build_graph,
 }
 
 
-def _parse_args(argv: list[str]) -> tuple[str, int | None]:
-    """Parse CLI args into a (command, limit) pair.
+def _parse_args(argv: list[str]) -> tuple[str, int | None, bool]:
+    """Parse CLI args into (command, limit, replace).
 
     Backward compatible: no args or a leading integer selects the default
     ``contextual`` build, so ``python -m ragpipe.ingest`` (the azure.yaml
     postprovision hook) and ``python -m ragpipe.ingest 3`` (README smoke) keep
-    working. A leading command name selects a substrate builder, with an
-    optional trailing limit: ``python -m ragpipe.ingest graph 3``.
+    working. A leading command name selects a builder, with an optional trailing
+    limit: ``python -m ragpipe.ingest graph 3``. ``--replace`` anywhere drops and
+    reloads the builder's tables (an embedding-model switch).
     """
+    replace = "--replace" in argv
+    args = [a for a in argv if a != "--replace"]
     command = "contextual"
-    rest = argv
-    if argv and not argv[0].lstrip("-").isdigit():
-        command = argv[0]
-        rest = argv[1:]
-    if command != "contextual" and command not in _BUILDERS:
+    rest = args
+    if args and not args[0].lstrip("-").isdigit():
+        command = args[0]
+        rest = args[1:]
+    if command not in _BUILDERS:
         raise SystemExit(
-            f"unknown command {command!r}; expected one of: "
-            f"contextual, {', '.join(_BUILDERS)}"
+            f"unknown command {command!r}; expected one of: {', '.join(_BUILDERS)}"
         )
     limit = int(rest[0]) if rest else None
-    return command, limit
+    return command, limit, replace
+
+
+# The tables each builder writes, for the preflight check.
+BUILDER_TABLES: dict[str, tuple[TableSpec, ...]] = {
+    "contextual": (MS_DOCS,),
+    "baseline": (BASELINE,),
+    "raptor": (RAPTOR_SAC,),
+    "graph": (GRAPH_ENTITIES, GRAPH_RELATIONSHIPS, GRAPH_COMMUNITIES),
+}
+
+
+def _preflight(settings: Any, command: str, replace: bool) -> None:  # pragma: no cover - needs a database
+    """Fail before crawling or paying for anything: the database must be
+    reachable as the owner, and (unless replacing) the builder's tables must
+    hold vectors from the configured embedding model."""
+    from ragpipe.pg_write import EmbeddingMismatch, check_writable, connect_owner
+
+    with connect_owner() as conn:
+        if replace:
+            return
+        for spec in BUILDER_TABLES[command]:
+            try:
+                check_writable(conn, spec, settings.embedding)
+            except EmbeddingMismatch as err:
+                raise SystemExit(f"refusing to ingest: {err}") from None
+
+
+def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integration entry point
+    from ragpipe.config import Settings
+
+    command, limit, replace = _parse_args(sys.argv[1:] if argv is None else argv)
+    settings = Settings.from_env()
+    _preflight(settings, command, replace)
+    _BUILDERS[command](settings, limit=limit, replace=replace)
 
 
 if __name__ == "__main__":  # pragma: no cover
-    import sys
-
-    command, limit = _parse_args(sys.argv[1:])
-    if command == "contextual":
-        main(limit=limit)
-    else:
-        from ragpipe.config import Settings
-
-        _BUILDERS[command](Settings.from_env(), limit=limit)
+    main()

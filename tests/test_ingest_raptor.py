@@ -11,6 +11,6 @@ def test_summary_documents_carry_level_and_embedding():
     assert d["id"] == "raptor-L1-0"
     assert d["level"] == 1
     assert d["content"] == "a summary"
-    assert d["content_vector"] == [0.5]
+    assert d["embedding"] == [0.5]
     assert d.get("context", "") == ""
     assert d["url"] == ""

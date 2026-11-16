@@ -1,5 +1,8 @@
 """Load a ragpipe-search export into Postgres (issue #37, ADR-0021).
 
+Ingest writes Postgres itself since #45; this stays as the restore path from the
+2026-10-24 export (the Azure index it came from is gone).
+
     uv run python -m ragpipe.pg_import ~/ingest-artifacts/rag/2026-10-24
 
 Runs from the laptop as the database owner (``RAG_IMPORT_DATABASE_URL``, the
@@ -20,17 +23,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ragpipe.pgstore import TABLES, TableSpec, create_table_sql, fill_doc_len_sql, vector_literal
+from ragpipe.config import EmbeddingSpec
+from ragpipe.pg_write import prepare_table
+from ragpipe.pgstore import TABLES, TableSpec, fill_doc_len_sql, vector_literal
 
 # text-embedding-3-small, USD per 1M tokens (Azure OpenAI, 2026-10). Only for the
-# spend line at the end; the bill is what counts.
+# spend line at the end, and only printed for that model; the bill is what counts.
 EMBEDDING_USD_PER_MTOK = 0.02
+PRICED_MODEL = "text-embedding-3-small"
 
 
 class ExportError(Exception):
@@ -102,6 +107,7 @@ def import_table(
     spec: TableSpec,
     rows: list[dict[str, Any]],
     embed_batch: Callable[[list[str]], list[list[float]]],
+    embedding: EmbeddingSpec,
     *,
     replace: bool = False,
     batch_size: int = 512,
@@ -109,11 +115,9 @@ def import_table(
 ) -> TableResult:
     """Make ``spec``'s table hold exactly ``rows``. ``conn`` is an autocommit
     psycopg connection; each batch commits on its own, so an interrupted import
-    keeps (and doesn't re-embed) what it already loaded."""
-    if replace:
-        conn.execute(f"DROP TABLE IF EXISTS {spec.qualified}")
-    for stmt in create_table_sql(spec):
-        conn.execute(stmt)
+    keeps (and doesn't re-embed) what it already loaded. A table filled by
+    another embedding model is refused unless ``replace``."""
+    prepare_table(conn, spec, embedding, replace=replace)
 
     wanted = {r["id"] for r in rows}
     present = {r[0] for r in conn.execute(f"SELECT id FROM {spec.qualified}")}
@@ -154,12 +158,11 @@ def import_table(
 
 
 def main(argv: list[str] | None = None) -> None:  # pragma: no cover - live DB + Azure
-    import psycopg
     from dotenv import load_dotenv
 
     from ragpipe.config import Settings
     from ragpipe.embeddings import build_batch_embed_fn
-    from ragpipe.pgstore import SCHEMA
+    from ragpipe.pg_write import connect_owner
 
     parser = argparse.ArgumentParser(prog="python -m ragpipe.pg_import")
     parser.add_argument("export_dir", type=Path)
@@ -169,10 +172,6 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - live DB +
     args = parser.parse_args(argv)
 
     load_dotenv()
-    url = os.environ.get("RAG_IMPORT_DATABASE_URL")
-    if not url:
-        raise SystemExit("set RAG_IMPORT_DATABASE_URL to the owner login (rag)")
-
     try:
         export = read_export(args.export_dir.expanduser())
     except ExportError as err:
@@ -185,19 +184,25 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - live DB +
         nonlocal tokens
         tokens += n
 
-    embed_batch = build_batch_embed_fn(Settings.from_env(load=False), on_tokens=count)
+    settings = Settings.from_env(load=False)
+    embedding = settings.embedding
+    embed_batch = build_batch_embed_fn(settings, on_tokens=count)
     results = []
-    with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+    with connect_owner() as conn:
         for spec in TABLES:
             results.append(
-                import_table(conn, spec, export[spec.index], embed_batch, replace=args.replace)
+                import_table(
+                    conn, spec, export[spec.index], embed_batch, embedding, replace=args.replace
+                )
             )
 
     for r in results:
         print(f"{r.table}: {r.rows} rows ({r.inserted} loaded, {r.deleted} removed)")
-    usd = tokens / 1_000_000 * EMBEDDING_USD_PER_MTOK
-    print(f"embedding spend: {tokens:,} tokens, about ${usd:.4f} at ${EMBEDDING_USD_PER_MTOK}/1M")
+    line = f"embedding spend: {tokens:,} tokens on {embedding.model}"
+    if embedding.model == PRICED_MODEL and not embedding.base_url:
+        usd = tokens / 1_000_000 * EMBEDDING_USD_PER_MTOK
+        line += f", about ${usd:.4f} at ${EMBEDDING_USD_PER_MTOK}/1M"
+    print(line)
 
 
 if __name__ == "__main__":  # pragma: no cover

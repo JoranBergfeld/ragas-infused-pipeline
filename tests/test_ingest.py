@@ -5,10 +5,9 @@ import pytest
 from ragpipe.ingest import (
     _graph_extract_workers,
     _parse_args,
-    _upload_batch_with_retry,
     build_documents,
-    prune_stale_documents,
 )
+from ragpipe.pgstore import MS_DOCS, RAPTOR_SAC
 
 
 def _fake_batch_embed(texts):
@@ -49,7 +48,9 @@ def test_build_documents_chunks_embeds_and_decorates():
     # ADR-0003: content stays clean; decoration lives in `context`
     assert "generated ctx" not in first["content"]
     assert first["context"] == "T > H\ngenerated ctx"
-    assert len(first["content_vector"]) == 2
+    assert len(first["embedding"]) == 2
+    # every column the table has, plus the vector
+    assert set(first) == set(MS_DOCS.columns) | {"embedding"}
 
 
 def test_build_documents_breadcrumb_only_on_empty_context():
@@ -77,61 +78,36 @@ def test_build_documents_embeds_decorated_text_in_chunk_order():
     assert len(docs) >= 3
 
 
-class _FakeSearchClient:
-    """Minimal stand-in: returns the indexed ids, records deleted batches."""
+def test_raptor_leaves_embed_through_the_raptor_spec():
+    pages = [{"url": "http://x", "title": "T", "markdown": "# H\n\nbody"}]
+    seen = []
 
-    def __init__(self, existing_ids):
-        self._existing = [{"id": i} for i in existing_ids]
-        self.deleted: list[str] = []
+    def batch(texts):
+        seen.extend(texts)
+        return [[0.0, 0.0] for _ in texts]
 
-    def search(self, *, search_text, select):
-        return iter(self._existing)
-
-    def delete_documents(self, batch):
-        self.deleted.extend(doc["id"] for doc in batch)
-
-
-def test_prune_removes_only_ids_absent_from_fresh_set():
-    client = _FakeSearchClient(["a", "b", "c", "d"])
-
-    pruned = prune_stale_documents(client, fresh_ids={"a", "c"}, batch_size=500)
-
-    assert pruned == 2
-    assert sorted(client.deleted) == ["b", "d"]
-
-
-def test_prune_keeps_everything_when_corpus_unchanged():
-    client = _FakeSearchClient(["a", "b"])
-
-    pruned = prune_stale_documents(client, fresh_ids={"a", "b"})
-
-    assert pruned == 0
-    assert client.deleted == []
-
-
-def test_prune_batches_large_stale_sets():
-    existing = [str(n) for n in range(1200)]
-    client = _FakeSearchClient(existing)
-
-    # keep none -> all 1200 are stale, deleted across 500-sized batches
-    pruned = prune_stale_documents(client, fresh_ids=set(), batch_size=500)
-
-    assert pruned == 1200
-    assert sorted(client.deleted, key=int) == existing
+    docs = build_documents(pages, embed_batch_fn=batch, context_fn=_no_context, spec=RAPTOR_SAC)
+    assert seen == [RAPTOR_SAC.embed_input({**d, "level": 0}) for d in docs]
 
 
 def test_parse_args_defaults_to_contextual_for_backward_compat():
     # The azure.yaml postprovision hook calls `python -m ragpipe.ingest` (no args)
     # and the README smokes with a bare integer limit; both must stay 'contextual'.
-    assert _parse_args([]) == ("contextual", None)
-    assert _parse_args(["3"]) == ("contextual", 3)
-    assert _parse_args(["contextual", "5"]) == ("contextual", 5)
+    assert _parse_args([]) == ("contextual", None, False)
+    assert _parse_args(["3"]) == ("contextual", 3, False)
+    assert _parse_args(["contextual", "5"]) == ("contextual", 5, False)
 
 
 def test_parse_args_selects_substrate_builders_with_optional_limit():
-    assert _parse_args(["baseline"]) == ("baseline", None)
-    assert _parse_args(["raptor", "3"]) == ("raptor", 3)
-    assert _parse_args(["graph", "10"]) == ("graph", 10)
+    assert _parse_args(["baseline"]) == ("baseline", None, False)
+    assert _parse_args(["raptor", "3"]) == ("raptor", 3, False)
+    assert _parse_args(["graph", "10"]) == ("graph", 10, False)
+
+
+def test_parse_args_replace_anywhere():
+    assert _parse_args(["--replace"]) == ("contextual", None, True)
+    assert _parse_args(["graph", "--replace"]) == ("graph", None, True)
+    assert _parse_args(["--replace", "baseline", "3"]) == ("baseline", 3, True)
 
 
 def test_parse_args_rejects_unknown_command():
@@ -152,29 +128,11 @@ def test_graph_extract_workers_resolution(monkeypatch):
     assert _graph_extract_workers(0) == 1
 
 
-class _FlakyClient:
-    """upload_documents fails `fail_times` times, then succeeds; records calls."""
+def test_every_builder_names_the_tables_it_writes():
+    from ragpipe.ingest import _BUILDERS, BUILDER_TABLES
+    from ragpipe.pgstore import TABLES
 
-    def __init__(self, fail_times):
-        self.fail_times = fail_times
-        self.calls = 0
-
-    def upload_documents(self, batch):
-        self.calls += 1
-        if self.calls <= self.fail_times:
-            raise RuntimeError("('Connection aborted.', write operation timed out)")
-
-
-def test_upload_batch_with_retry_recovers_from_transient_failures():
-    client = _FlakyClient(fail_times=2)
-    sleeps = []
-    _upload_batch_with_retry(client, [{"id": "1"}], sleep_fn=sleeps.append)
-    assert client.calls == 3  # 2 failures + 1 success
-    assert sleeps == [1, 2]  # exponential backoff between attempts
-
-
-def test_upload_batch_with_retry_raises_after_exhausting_retries():
-    client = _FlakyClient(fail_times=99)
-    with pytest.raises(RuntimeError):
-        _upload_batch_with_retry(client, [{"id": "1"}], max_retries=3, sleep_fn=lambda _d: None)
-    assert client.calls == 4  # initial attempt + 3 retries
+    assert set(BUILDER_TABLES) == set(_BUILDERS)
+    assert sorted(s.table for specs in BUILDER_TABLES.values() for s in specs) == sorted(
+        s.table for s in TABLES
+    )

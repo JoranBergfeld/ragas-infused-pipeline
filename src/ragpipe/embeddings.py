@@ -1,5 +1,11 @@
 """Embedding helper.
 
+Which model embeds is one setting, ``Settings.embedding`` (``EmbeddingSpec``), read
+by both ingest and serving so the stored vectors and the query vector always come
+from the same model (issue #45). With ``EMBEDDING_BASE_URL`` set, the client is a
+plain OpenAI-compatible one against that server (vLLM on the Spark, say). Unset, it
+is the Foundry account's Azure OpenAI route described below.
+
 `FoundryEmbeddingClient` (agent_framework.foundry) targets the Azure AI *Inference*
 (`/models`) API, which serves Models-as-a-Service models (Cohere, etc.). Our embedding
 model, `text-embedding-3-small`, is an **Azure OpenAI** deployment — served only on the
@@ -17,7 +23,7 @@ from __future__ import annotations
 from typing import Callable
 from urllib.parse import urlparse
 
-from ragpipe.config import Settings
+from ragpipe.config import EmbeddingSpec, Settings
 from ragpipe.usage import STAGE_QUERY_EMBEDDING, record_openai_embedding
 
 COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
@@ -59,11 +65,24 @@ def anthropic_endpoint_from_project(project_endpoint: str) -> str:
 
 
 def _build_client(settings: Settings, api_version: str, timeout: float, max_retries: int):  # pragma: no cover - live Azure
-    """Build an AzureOpenAI client for the account's /openai endpoint with Entra auth.
+    """Build the embeddings client for ``settings.embedding``.
 
+    An OpenAI-compatible server when ``base_url`` is set (bearer ``api_key``, if
+    any); otherwise AzureOpenAI on the account's /openai endpoint with Entra auth.
     `timeout` + `max_retries` matter for bulk work: without a timeout a throttled
     call blocks its worker thread indefinitely; bounded retries back off on 429s.
     """
+    spec = settings.embedding
+    if spec.base_url:
+        from openai import OpenAI
+
+        return OpenAI(
+            base_url=spec.base_url,
+            api_key=spec.api_key or "unused",
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+
     from azure.identity import DefaultAzureCredential, get_bearer_token_provider
     from openai import AzureOpenAI
 
@@ -79,13 +98,32 @@ def _build_client(settings: Settings, api_version: str, timeout: float, max_retr
     )
 
 
+class EmbeddingDimensionError(ValueError):
+    """The model returned vectors of a different size than EMBEDDING_DIMENSIONS."""
+
+
+def check_dimensions(spec: EmbeddingSpec, vectors: list[list[float]]) -> list[list[float]]:
+    """Return ``vectors`` unchanged if every one has ``spec.dimensions`` entries.
+
+    A model swap without the matching EMBEDDING_DIMENSIONS would otherwise surface
+    as a pgvector "different vector dimensions" error deep in a query or a load.
+    """
+    for v in vectors:
+        if len(v) != spec.dimensions:
+            raise EmbeddingDimensionError(
+                f"{spec.model} returned a {len(v)}-dim vector, "
+                f"EMBEDDING_DIMENSIONS is {spec.dimensions}"
+            )
+    return vectors
+
+
 def build_embed_fn(
     settings: Settings,
     api_version: str = "2024-10-21",
     timeout: float = 30.0,
     max_retries: int = 8,
 ) -> Callable[[str], list[float]]:  # pragma: no cover - live Azure call
-    """Return a synchronous `embed(text) -> list[float]` over Azure OpenAI + Entra auth.
+    """Return a synchronous `embed(text) -> list[float]` for ``settings.embedding``.
 
     The underlying `openai` client is synchronous, so the returned callable is safe to
     invoke from inside a running event loop (the retrievers call it that way).
@@ -95,17 +133,14 @@ def build_embed_fn(
     openai client otherwise waits on the socket forever). With them, 429s back off
     and retry a bounded number of times, then raise instead of hanging.
     """
+    spec = settings.embedding
     client = _build_client(settings, api_version, timeout, max_retries)
 
     def embed(text: str) -> list[float]:
-        result = client.embeddings.create(
-            model=settings.foundry_embedding_model, input=[text]
-        )
+        result = client.embeddings.create(model=spec.model, input=[text])
         # No-op outside a pipeline run, so ingest callers are unaffected.
-        record_openai_embedding(
-            STAGE_QUERY_EMBEDDING, settings.foundry_embedding_model, result
-        )
-        return list(result.data[0].embedding)
+        record_openai_embedding(STAGE_QUERY_EMBEDDING, spec.model, result)
+        return check_dimensions(spec, [list(result.data[0].embedding)])[0]
 
     return embed
 
@@ -165,16 +200,15 @@ def build_batch_embed_fn(
     ``on_tokens`` gets each request's billed prompt tokens, for callers that
     report their own spend (the Postgres import).
     """
+    spec = settings.embedding
     client = _build_client(settings, api_version, timeout, max_retries)
 
     def _embed_one(sub: list[str]) -> list[list[float]]:
-        result = client.embeddings.create(
-            model=settings.foundry_embedding_model, input=sub
-        )
-        if on_tokens is not None:
+        result = client.embeddings.create(model=spec.model, input=sub)
+        if on_tokens is not None and result.usage is not None:
             on_tokens(result.usage.prompt_tokens)
         ordered = sorted(result.data, key=lambda d: d.index)
-        return [list(d.embedding) for d in ordered]
+        return check_dimensions(spec, [list(d.embedding) for d in ordered])
 
     def embed_batch(texts: list[str]) -> list[list[float]]:
         return _embed_in_chunks(_embed_one, texts, max_inputs_per_request)

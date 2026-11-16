@@ -140,21 +140,15 @@ def detect_communities(entity_names: list[str], relationships: list[Relationship
     return mapping
 
 
-def entity_documents(
-    entities: list[Entity],
-    *,
-    community: dict[str, int],
-    embed_batch_fn: object,
-) -> list[dict]:
-    """Shape Entity records into Azure AI Search doc dicts."""
-    vecs = embed_batch_fn([e.description for e in entities])  # type: ignore[operator]
+def entity_documents(entities: list[Entity], *, community: dict[str, int]) -> list[dict]:
+    """Shape Entity records into ``rag.graph_entities`` rows (no vector yet:
+    ``pg_write.embed_rows`` embeds them through the table's ``embed_input``)."""
     return [
         {
             "id": f"entity-{i}",
             "name": e.name,
             "type": e.type,
             "description": e.description,
-            "description_vector": vecs[i],
             "community_id": community.get(e.name, -1),
             "source_urls": e.source_urls,
         }
@@ -162,16 +156,11 @@ def entity_documents(
     ]
 
 
-def relationship_documents(
-    relationships: list[Relationship],
-    *,
-    embed_batch_fn: object = None,
-) -> list[dict]:
-    """Shape Relationship records into Azure AI Search doc dicts."""
-    vecs = embed_batch_fn([r.description for r in relationships]) if embed_batch_fn is not None else None  # type: ignore[operator]
-    docs = []
-    for i, r in enumerate(relationships):
-        doc: dict = {
+def relationship_documents(relationships: list[Relationship]) -> list[dict]:
+    """Shape Relationship records into ``rag.graph_relationships`` rows. Never
+    embedded: ``build_adjacency`` only reads the text (ADR-0021)."""
+    return [
+        {
             "id": f"rel-{i}",
             "source": r.source,
             "target": r.target,
@@ -179,29 +168,21 @@ def relationship_documents(
             "weight": r.weight,
             "source_urls": r.source_urls,
         }
-        if vecs is not None:
-            doc["description_vector"] = vecs[i]
-        docs.append(doc)
-    return docs
+        for i, r in enumerate(relationships)
+    ]
 
 
-def community_documents(
-    communities: list[Community],
-    *,
-    embed_batch_fn: object,
-) -> list[dict]:
-    """Shape Community records into Azure AI Search doc dicts."""
-    vecs = embed_batch_fn([c.summary for c in communities])  # type: ignore[operator]
+def community_documents(communities: list[Community]) -> list[dict]:
+    """Shape Community records into ``rag.graph_communities`` rows (no vector yet)."""
     return [
         {
             "id": f"community-{c.id}",
             "level": c.level,
             "title": c.title,
             "summary": c.summary,
-            "summary_vector": vecs[i],
             "source_urls": c.source_urls,
         }
-        for i, c in enumerate(communities)
+        for c in communities
     ]
 
 

@@ -210,8 +210,10 @@ def test_embed_fn_records_query_embedding(monkeypatch):
             )
 
     monkeypatch.setattr(embeddings, "_build_client", lambda *a, **k: _Client())
+    from ragpipe.config import EmbeddingSpec
+
     embed = embeddings.build_embed_fn(
-        SimpleNamespace(foundry_embedding_model="text-embedding-3-small")
+        SimpleNamespace(embedding=EmbeddingSpec(model="text-embedding-3-small", dimensions=2))
     )
     with collect_usage([]) as entries:
         assert embed("what is RRF?") == [0.1, 0.2]

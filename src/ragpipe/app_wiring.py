@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 from typing import Awaitable, Callable
 
 from ragpipe.config import (
+    EMBEDDING_MISMATCH,
     RERANK_MODES,
     RERANKER_OFFLINE,
     ModeUnavailable,
@@ -60,6 +62,26 @@ def make_deps(settings, retrieve, reranker, generator, gate) -> PipelineDeps:
 
 
 _pools: dict[str, object] = {}
+_embedding_ok: set[str] = set()
+
+
+def _embedding_mismatch(pool, settings: Settings) -> str | None:  # pragma: no cover - needs a database
+    """Why the tables can't be queried with ``settings.embedding``. Vectors from
+    two models compare without error and rank noise, so a mismatch refuses every
+    mode rather than answering badly (issue #45). Only a match is cached: after a
+    re-ingest the next request rechecks and goes through without a restart."""
+    from ragpipe.pg_write import recorded_mismatch
+
+    url = settings.rag_database_url or ""
+    if url in _embedding_ok:
+        return None
+    with pool.connection() as conn:
+        reason = recorded_mismatch(conn, settings.embedding)
+    if reason:
+        logging.getLogger(__name__).error("embedding mismatch: %s", reason)
+        return reason
+    _embedding_ok.add(url)
+    return None
 
 
 def _table_pool(database_url: str):  # pragma: no cover - needs a database
@@ -94,6 +116,8 @@ def build_pipeline_fn(
     if not settings.rag_database_url:
         raise ValueError("Required environment variable RAG_DATABASE_URL is not set")
     pool = _table_pool(settings.rag_database_url)
+    if _embedding_mismatch(pool, settings):
+        raise ModeUnavailable(mode, EMBEDDING_MISMATCH)
     # Generation and embeddings only: retrieval no longer touches Azure (ADR-0021).
     cred = DefaultAzureCredential()
     embed_raw = build_embed_fn(settings)

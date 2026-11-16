@@ -1,6 +1,7 @@
 # 0021 — Retrieval on pgvector in homelab's Postgres
 
-**Status:** Accepted (2026-10-24), amended 2026-10-25 for the reranker (#40)
+**Status:** Accepted (2026-10-24), amended 2026-10-25 for the reranker (#40) and 2026-11-16
+for ingest on Postgres and one embedding setting (#45)
 
 ## Context
 
@@ -89,7 +90,7 @@ converges on the export, never doubles rows, and a crash halfway resumes without
 - `paired_vs_baseline` is empty until `baseline` can run again, since that's the reference mode.
 - Ingest still writes Azure AI Search (now with its own `SEARCH_ENDPOINT`). Until it learns to
   write Postgres, a fresh corpus means ingest → export → import. That's a follow-up, and it
-  matters once the search service is deleted.
+  matters once the search service is deleted. *Done 2026-11-16, see the second amendment.*
 
 ## Amendment (2026-10-25): the Spark reranker (#40)
 
@@ -136,6 +137,69 @@ has to say so. It does (2026-10-25). With `baseline` back, `paired_vs_baseline` 
 - **Retrying forever / long timeouts.** A request stuck on a dead Spark holds a worker and
   the user's spinner. Fail fast and say why.
 
+## Amendment (2026-11-16): ingest writes Postgres, one embedding setting (#45)
+
+`ragpipe-search` was deleted on 2026-11-16. Serving didn't notice: homelab ran `/run` with
+`*.search.windows.net` blocked and got cited answers (homelab #186). Ingest did notice,
+because it still wrote through `search_index.py`, so a reingest had nowhere to go.
+
+**Ingest writes the `rag` schema directly.** Every builder (`contextual`, `baseline`,
+`raptor`, `graph`) writes its tables through `ragpipe.pg_write.write_table`, as the owner
+(`RAG_IMPORT_DATABASE_URL`), from the laptop. It uses the same `TableSpec`s and DDL as the
+import. ADR-0007's contract carries over unchanged: upsert by id, then delete the ids the
+fresh corpus lacks, with no prune on a LIMIT run. An overwritten row gets `doc_len` reset
+so BM25 recomputes it from the regenerated `tsv`. Each batch commits on its own, so a crash
+keeps what was written. Nothing GRANTs, because the database's default privileges already
+make `rag`'s tables readable to `rag_reader`. `search_index.py`, `azure-search-documents`,
+`SEARCH_ENDPOINT`/`SEARCH_INDEX` and the Bicep Search service with its role assignments
+are gone. `pg_import` stays, as the restore path from the 2026-10-24 export.
+
+**`TableSpec.embed_input` is the one definition of what a table's vectors embed.** Ingest
+and the import both embed through it (`pg_write.embed_rows`). Writing that down surfaced a
+divergence: the import had embedded `raptor_sac` leaves on `content` alone, while the
+ingest that built the Azure index embedded them on `context + content` (the SAC in the
+name). The spec now follows the ingest. Summary nodes have no context and embed their text.
+The table on homelab still holds the content-only vectors until `raptor` is re-ingested,
+and `raptor_sac`'s next eval should mention it.
+
+**One embedding setting for ingest and serving.** `Settings.embedding`
+(`config.EmbeddingSpec`) carries the model, the dimension, and optionally an
+OpenAI-compatible base URL and key, read from `EMBEDDING_MODEL` (default
+`FOUNDRY_EMBEDDING_MODEL`), `EMBEDDING_DIMENSIONS` (default 1536), `EMBEDDING_BASE_URL`
+and `EMBEDDING_API_KEY`. The `vector(N)` DDL reads N from it, which removes
+`EMBEDDING_DIMENSIONS = 1536` from `pgstore.py`. With no base URL the client is the
+Foundry account's Azure OpenAI route with Entra, as before. With one, it's a plain
+`openai.OpenAI` client, which is what vLLM on the Spark speaks. A response whose vectors
+aren't N long raises at once, rather than as a pgvector error later.
+
+**Each vector table records which model filled it**, in `rag.embedding_model`
+(`table_name`, `model`, `dimensions`). If the model or the column size differs, ingest and
+the import refuse before writing anything. `--replace` drops the table and reloads it.
+Serving reads the same record when it builds a pipeline. On a mismatch every mode answers
+`ModeUnavailable("embedding-mismatch")` (a 503, like `reranker-offline`), because two
+models' vectors compare without error and rank noise. Only a match is cached, so a
+re-ingest takes effect without a restart. A database filled before the record existed
+passes, and the first write claims its tables for the configured model.
+
+So moving to Nemotron-3.5-Embed-1B on the Spark (1024 dims, spark:8102) is configuration
+plus one re-embed: set the four variables on the service and on the laptop, then run
+`python -m ragpipe.ingest <builder> --replace` for each builder. Between the two steps,
+serving refuses instead of answering wrong. That switch is a separate decision.
+
+RAGAS `answer_relevancy` stays on `FOUNDRY_EMBEDDING_MODEL`. It's an eval measuring
+instrument, not retrieval, and moving it would shift every score in the eval history.
+
+### Rejected (amendment)
+
+- **Keeping the import as the only writer, fed by a local export from ingest.** That's two
+  steps and an intermediate format to keep in sync, all to avoid a dozen lines of upsert.
+- **Re-embedding only rows whose text changed** (a content hash per row). A full
+  re-embed of ~85k rows on `text-embedding-3-small` is well under a dollar, and free on the
+  Spark. The cached context generation is the expensive part, and it's already cached.
+- **Checking only the dimension.** Two different 1024-dim models fit the same column and
+  return garbage without an error. The model name has to be recorded.
+- **A separate embedding setting for serving.** That's the drift this amendment removes.
+
 ## Sources
 
 - personal-website ADR 0002, *Retrieval on Postgres, not Azure Search*:
@@ -158,3 +222,9 @@ has to say so. It does (2026-10-25). With `baseline` back, `paired_vs_baseline` 
   https://docs.vllm.ai/en/stable/models/pooling_models/scoring/#cohere-rerank-api
 - Azure AI Search, *Configure semantic ranker* (title, content and keyword fields, in
   priority order): https://learn.microsoft.com/en-us/azure/search/semantic-how-to-configure
+- PostgreSQL 16 docs, `INSERT … ON CONFLICT DO UPDATE`:
+  https://www.postgresql.org/docs/16/sql-insert.html#SQL-ON-CONFLICT
+- pgvector README, the `vector(n)` type and dimension checks: https://github.com/pgvector/pgvector#storing
+- vLLM docs, OpenAI-compatible Embeddings API (`/v1/embeddings`):
+  https://docs.vllm.ai/en/stable/serving/openai_compatible_server/#embeddings-api
+- homelab #186 (Search deletion and the serving check): https://github.com/JoranBergfeld/homelab/issues/186
