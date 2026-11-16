@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ragpipe.config import EmbeddingSpec
-from ragpipe.pg_write import prepare_table
+from ragpipe.pg_write import document_input, prepare_table
 from ragpipe.pgstore import TABLES, TableSpec, fill_doc_len_sql, vector_literal
 
 # text-embedding-3-small, USD per 1M tokens (Azure OpenAI, 2026-10). Only for the
@@ -60,7 +60,7 @@ def read_export(export_dir: Path, specs: tuple[TableSpec, ...] = TABLES) -> dict
     manifest_path = export_dir / "manifest.json"
     if not manifest_path.is_file():
         raise ExportError(f"no manifest.json in {export_dir}")
-    indexes = json.loads(manifest_path.read_text())["indexes"]
+    indexes = json.loads(manifest_path.read_text(encoding="utf-8"))["indexes"]
 
     out: dict[str, list[dict]] = {}
     for spec in specs:
@@ -81,7 +81,7 @@ def read_export(export_dir: Path, specs: tuple[TableSpec, ...] = TABLES) -> dict
                 f"{spec.index}: sha256 mismatch on {entry['file']} "
                 f"(manifest {entry['sha256'][:12]}…, file {actual[:12]}…)"
             )
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             rows = [json.loads(line) for line in f if line.strip()]
         if len(rows) != entry["expected"]:
             raise ExportError(f"{spec.index}: {len(rows)} rows, manifest says {entry['expected']}")
@@ -135,7 +135,7 @@ def import_table(
     for start in range(0, len(todo), batch_size):
         batch = todo[start : start + batch_size]
         vectors = (
-            embed_batch([spec.embed_input(r) for r in batch])
+            embed_batch([document_input(spec, r, embedding) for r in batch])
             if spec.embed_input is not None
             else None
         )

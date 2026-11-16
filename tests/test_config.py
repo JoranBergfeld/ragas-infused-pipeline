@@ -44,7 +44,8 @@ def _base_env(monkeypatch):
     monkeypatch.delenv("OFFLINE_JUDGE_MODEL", raising=False)
     monkeypatch.delenv("GRAPH_QUERY_ROUTING", raising=False)
     monkeypatch.delenv("RAG_DATABASE_URL", raising=False)
-    for k in ("EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY"):
+    for k in ("EMBEDDING_MODEL", "EMBEDDING_DIMENSIONS", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY",
+              "EMBEDDING_QUERY_PROMPT", "EMBEDDING_DOCUMENT_PROMPT"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -201,3 +202,13 @@ def test_embedding_dimensions_must_be_positive(monkeypatch):
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "0")
     with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
         Settings.from_env(load=False)
+
+
+def test_embedding_prompts_are_read_verbatim(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_QUERY_PROMPT", "task: search result | query: ")
+    monkeypatch.setenv("EMBEDDING_DOCUMENT_PROMPT", "title: none | text: ")
+    e = Settings.from_env(load=False).embedding
+    # the trailing space is part of the prompt
+    assert e.query_prompt == "task: search result | query: "
+    assert e.document_prompt == "title: none | text: "

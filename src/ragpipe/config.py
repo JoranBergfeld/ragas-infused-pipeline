@@ -86,16 +86,35 @@ class EmbeddingSpec:
     route with Entra auth. Set: any OpenAI-compatible ``/v1/embeddings`` server (e.g.
     vLLM on the Spark), with ``api_key`` as a bearer token. Switching model is a
     config change plus ``python -m ragpipe.ingest <builder> --replace``.
+
+    ``query_prompt`` / ``document_prompt`` are the model's asymmetric prefixes
+    (EmbeddingGemma: ``task: search result | query: `` and ``title: none | text: ``).
+    vLLM doesn't add them, so the caller must, identically at ingest and at query
+    time, or retrieval degrades without an error. That's why they're part of the
+    recorded embedding identity (issue #47). ``{title}`` in the document prompt is
+    filled with the row's title, or ``none`` when the row has none.
     """
 
     model: str
     dimensions: int = 1536
     base_url: str | None = None
     api_key: str | None = None
+    query_prompt: str = ""
+    document_prompt: str = ""
 
     def __post_init__(self) -> None:
         if self.dimensions < 1:
             raise ValueError(f"EMBEDDING_DIMENSIONS must be >= 1, got {self.dimensions}")
+
+    def query_text(self, text: str) -> str:
+        """What the model embeds for a search query."""
+        return f"{self.query_prompt}{text}"
+
+    def document_text(self, text: str, title: str | None = None) -> str:
+        """What the model embeds for a stored text document. Text only: an image
+        document would go through its own input builder, not this one."""
+        prefix = self.document_prompt.replace("{title}", (title or "").strip() or "none")
+        return f"{prefix}{text}"
 
 
 def _require(name: str) -> str:
@@ -148,6 +167,8 @@ class Settings:
     embedding_dimensions: int = 1536
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None
+    embedding_query_prompt: str = ""
+    embedding_document_prompt: str = ""
 
     @property
     def embedding(self) -> EmbeddingSpec:
@@ -156,6 +177,8 @@ class Settings:
             dimensions=self.embedding_dimensions,
             base_url=self.embedding_base_url,
             api_key=self.embedding_api_key,
+            query_prompt=self.embedding_query_prompt,
+            document_prompt=self.embedding_document_prompt,
         )
 
     def __post_init__(self) -> None:
@@ -206,4 +229,7 @@ class Settings:
             embedding_dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1536")),
             embedding_base_url=os.environ.get("EMBEDDING_BASE_URL") or None,
             embedding_api_key=os.environ.get("EMBEDDING_API_KEY") or None,
+            # Not stripped: the trailing space after "query:" is part of the prompt.
+            embedding_query_prompt=os.environ.get("EMBEDDING_QUERY_PROMPT", ""),
+            embedding_document_prompt=os.environ.get("EMBEDDING_DOCUMENT_PROMPT", ""),
         )

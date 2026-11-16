@@ -1,7 +1,7 @@
 # 0021 — Retrieval on pgvector in homelab's Postgres
 
 **Status:** Accepted (2026-10-24), amended 2026-10-25 for the reranker (#40) and 2026-11-16
-for ingest on Postgres and one embedding setting (#45)
+for ingest on Postgres and one embedding setting (#45), and for embedding prompts (#47)
 
 ## Context
 
@@ -200,6 +200,43 @@ instrument, not retrieval, and moving it would shift every score in the eval his
   return garbage without an error. The model name has to be recorded.
 - **A separate embedding setting for serving.** That's the drift this amendment removes.
 
+## Amendment (2026-11-16): prompts are part of the embedding identity (#47)
+
+The embedder is moving to EmbeddingGemma 2 on the Spark (`google/embeddinggemma-2`,
+spark:8103). The user chose it for its multimodality, not because it won a bake-off
+(homelab #220). Like most asymmetric retrieval models it expects one prompt on queries and
+another on documents (`task: search result | query: ` / `title: none | text: `). vLLM's
+OpenAI-compatible endpoint doesn't add them. If ingest and serving disagree on them,
+nothing errors and retrieval just gets worse.
+
+**So the prompts join the setting and the record.** `EMBEDDING_QUERY_PROMPT` and
+`EMBEDDING_DOCUMENT_PROMPT` (default empty, so `text-embedding-3-small` is unchanged) live
+in `EmbeddingSpec`. `build_embed_fn` adds the query prompt, and
+`pg_write.document_input` adds the document prompt in front of the table's
+`embed_input`, for ingest and the import alike. `{title}` in the document prompt is
+filled from the row's `title` (an entity's `name`), or `none`. RAPTOR's summary vectors
+go through `document_input` too, not through the tree builder's embedding. The batch
+embedder adds nothing, so there is exactly one place per side.
+`rag.embedding_model` gained `query_prompt` and `document_prompt`. Ingest's mismatch
+check and serving's `embedding-mismatch` compare all four fields, so a prompt change is
+handled like a model change. The owner migrates an older record table in place. Serving,
+which is read-only, reads rows as JSON, so it copes with either shape.
+
+**OpenAI-compatible servers are sent `dimensions`.** That gets a Matryoshka model to
+return the configured size (Gemma 768 → 512). The Foundry route still sends none, as
+before.
+
+**Multimodal later, not now.** The point of Gemma is putting images in the same space.
+Text is the only input today. The prompt goes through `EmbeddingSpec.document_text`,
+which says it's text-only, so an image document gets its own input builder beside it
+rather than a text assumption to unpick.
+
+### Rejected (#47)
+
+- **Prompts inside each `TableSpec.embed_input`.** Those lambdas say *what* a table embeds;
+  the prompt belongs to the model, and would have to be repeated in six places.
+- **Not recording the prompts.** Same failure as not recording the model, just quieter.
+
 ## Sources
 
 - personal-website ADR 0002, *Retrieval on Postgres, not Azure Search*:
@@ -228,3 +265,10 @@ instrument, not retrieval, and moving it would shift every score in the eval his
 - vLLM docs, OpenAI-compatible Embeddings API (`/v1/embeddings`):
   https://docs.vllm.ai/en/stable/serving/openai_compatible_server/#embeddings-api
 - homelab #186 (Search deletion and the serving check): https://github.com/JoranBergfeld/homelab/issues/186
+- homelab #220 (EmbeddingGemma 2 chosen for multimodality): https://github.com/JoranBergfeld/homelab/issues/220
+- EmbeddingGemma (first generation) model card, the same prompt scheme
+  (`task: search result | query: `, `title: none | text: `) and Matryoshka sizes:
+  https://huggingface.co/google/embeddinggemma-300m. Gemma 2's values come from its own
+  `config_sentence_transformers.json`, as read by homelab (#220).
+- vLLM docs, `dimensions` on the Embeddings API for Matryoshka models:
+  https://docs.vllm.ai/en/stable/models/pooling_models/#matryoshka-embeddings

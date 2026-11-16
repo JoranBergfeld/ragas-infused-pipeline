@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 
 from ragpipe.chunking import chunk_markdown
 from ragpipe.extraction import html_to_markdown
+from ragpipe.config import EmbeddingSpec
 from ragpipe.pg_write import embed_rows
 from ragpipe.pgstore import (
     BASELINE,
@@ -50,6 +51,7 @@ def build_documents(
     batch_size: int = 64,
     context_workers: int = 4,
     spec: TableSpec = MS_DOCS,
+    embedding: EmbeddingSpec | None = None,
 ) -> list[dict[str, Any]]:
     """Turn fetched pages into decorated ``rag.ms_docs`` rows.
 
@@ -91,7 +93,7 @@ def build_documents(
         for meta, chunk, ctx in zip(metas, chunks, contexts)
     ]
     print(f"Embedding {total} chunks in batches of {batch_size}…", flush=True)
-    return embed_rows(spec, rows, embed_batch_fn, batch_size=batch_size, log=_log)
+    return embed_rows(spec, rows, embed_batch_fn, embedding, batch_size=batch_size, log=_log)
 
 
 def build_baseline_documents(
@@ -100,6 +102,7 @@ def build_baseline_documents(
     max_chars: int = 2000,
     overlap: int = 200,
     batch_size: int = 64,
+    embedding: EmbeddingSpec | None = None,
 ) -> list[dict[str, Any]]:
     """Build plain (no contextual decoration) rows for ``rag.baseline``.
 
@@ -123,7 +126,7 @@ def build_baseline_documents(
                     "context": "",
                 }
             )
-    return embed_rows(BASELINE, docs, embed_batch_fn, batch_size=batch_size, log=_log)
+    return embed_rows(BASELINE, docs, embed_batch_fn, embedding, batch_size=batch_size, log=_log)
 
 
 def fetch_pages(
@@ -240,7 +243,10 @@ def build_contextual(
     if not pages:
         raise SystemExit("No pages fetched; nothing to ingest.")
 
-    docs = build_documents(pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate)
+    docs = build_documents(
+        pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate,
+        embedding=settings.embedding,
+    )
     if context_gen.fallback_count:
         print(f"  context fallbacks (breadcrumb-only): {context_gen.fallback_count}", flush=True)
     print(f"{len(docs)} chunks from {len(pages)} pages.", flush=True)
@@ -296,7 +302,8 @@ def build_raptor(
 
     # 1. Build SAC leaf docs (same decoration as the contextual table)
     leaf_docs = build_documents(
-        pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate, spec=RAPTOR_SAC
+        pages, embed_batch_fn=embed_batch, context_fn=context_gen.generate, spec=RAPTOR_SAC,
+        embedding=settings.embedding,
     )
     if context_gen.fallback_count:
         print(f"  context fallbacks (breadcrumb-only): {context_gen.fallback_count}", flush=True)
@@ -336,16 +343,26 @@ def build_raptor(
 
     # 4. Build RAPTOR tree
     print(f"Building RAPTOR tree from {len(leaves)} leaves (max_levels={settings.raptor_max_levels})…", flush=True)
+    def embed_summaries(texts: list[str]) -> list[list[float]]:
+        # Cluster upper levels in the same (document-prompted) space as the leaves.
+        return embed_batch([settings.embedding.document_text(t) for t in texts])
+
     summaries = build_raptor_tree(
         leaves,
         summarize_fn=summarize_fn,
-        embed_batch_fn=embed_batch,
+        embed_batch_fn=embed_summaries,
         max_levels=settings.raptor_max_levels,
     )
     print(f"  RAPTOR produced {len(summaries)} summary nodes.", flush=True)
 
     # 5. Write leaves + summaries (prune skipped on a partial ingest).
-    docs = leaf_docs + raptor_summary_documents(summaries)
+    # Stored summary vectors come from document_input like every other row, so a
+    # {title} in the document prompt sees the row's title, not the tree's "none".
+    summary_docs = embed_rows(
+        RAPTOR_SAC, raptor_summary_documents(summaries), embed_batch, settings.embedding,
+        log=_log,
+    )
+    docs = leaf_docs + summary_docs
     print(f"{len(leaf_docs)} leaves + {len(summaries)} summary nodes.", flush=True)
     _write(settings, RAPTOR_SAC, docs, limit=limit, replace=replace)
 
@@ -360,7 +377,7 @@ def build_baseline(
     pages = fetch_pages(_source_urls(limit))
     if not pages:
         raise SystemExit("No pages fetched; nothing to ingest.")
-    docs = build_baseline_documents(pages, embed_batch_fn=embed_batch)
+    docs = build_baseline_documents(pages, embed_batch_fn=embed_batch, embedding=settings.embedding)
     print(f"{len(docs)} chunks from {len(pages)} pages.", flush=True)
     _write(settings, BASELINE, docs, limit=limit, replace=replace)
 
@@ -404,11 +421,11 @@ def _finish_graph(
     # here can't blow the per-request array cap or the TPM limit.
     ent_docs = embed_rows(
         GRAPH_ENTITIES, entity_documents(entities, community=community_map), embed_batch,
-        batch_size=2048, log=_log,
+        settings.embedding, batch_size=2048, log=_log,
     )
     com_docs = embed_rows(
         GRAPH_COMMUNITIES, community_documents(communities), embed_batch,
-        batch_size=2048, log=_log,
+        settings.embedding, batch_size=2048, log=_log,
     )
     rel_docs = relationship_documents(relationships)
 

@@ -96,13 +96,22 @@ EMBEDDING_MODEL=text-embedding-3-small   # unset: FOUNDRY_EMBEDDING_MODEL
 EMBEDDING_DIMENSIONS=1536                # the vector(N) column size
 EMBEDDING_BASE_URL=                      # unset: the Foundry account's Azure OpenAI route
 EMBEDDING_API_KEY=                       # bearer token for EMBEDDING_BASE_URL
+EMBEDDING_QUERY_PROMPT=                  # prepended to queries, e.g. "task: search result | query: "
+EMBEDDING_DOCUMENT_PROMPT=               # prepended to stored text, e.g. "title: {title} | text: "
 ```
 
-Every vector table records the model that filled it (`rag.embedding_model`). Ingest refuses
-to write a table with another model or dimension, and serving answers `503
-embedding-mismatch` until the two agree. Moving to another model, such as the Spark's
-OpenAI-compatible server, is a config change plus a re-embed: set the four variables for
-the service *and* the laptop, then run each builder with `--replace` (drop and reload):
+Models like EmbeddingGemma expect different prompts on the query side and the document
+side, and vLLM doesn't add them. So we prepend them ourselves, the same way at ingest and at
+query time (issue #47). `{title}` in the document prompt is filled with the row's title, or
+`none` when it has none. Both default to empty, which is right for `text-embedding-3-small`.
+An OpenAI-compatible server is also sent `dimensions`, so a Matryoshka size such as 512
+comes back at the configured size.
+
+Every vector table records what filled it (`rag.embedding_model`): the model, the dimension
+and both prompts. Ingest refuses to write a table where any of these differ, and serving
+answers `503 embedding-mismatch` until the two agree. Moving to another model, such as
+EmbeddingGemma 2 on the Spark, is a config change plus a re-embed: set the variables for the
+service *and* the laptop, then run each builder with `--replace` (drop and reload):
 
 ```bash
 uv run python -m ragpipe.ingest contextual --replace   # then baseline, raptor, graph
@@ -110,6 +119,10 @@ uv run python -m ragpipe.ingest contextual --replace   # then baseline, raptor, 
 
 RAGAS `answer_relevancy` keeps using `FOUNDRY_EMBEDDING_MODEL`. It's an eval measuring
 instrument, and moving it would make eval history incomparable.
+
+Before switching, `scripts/compare_embeddings.py` compares settings on the real corpus. It
+loads the export into scratch databases (never `rag`) and scores the hand-authored test set's
+URL hit rate and MRR on the dense and hybrid legs. It runs no generation and no judges.
 
 ## Retrieval store (Postgres)
 

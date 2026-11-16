@@ -98,6 +98,13 @@ def _build_client(settings: Settings, api_version: str, timeout: float, max_retr
     )
 
 
+def request_options(spec: EmbeddingSpec) -> dict:
+    """Extra request fields. An OpenAI-compatible server gets ``dimensions``, so a
+    Matryoshka model (EmbeddingGemma 768 -> 512, Nemotron 2048 -> 1024) returns
+    the configured size. The Foundry route keeps sending none, as before."""
+    return {"dimensions": spec.dimensions} if spec.base_url else {}
+
+
 class EmbeddingDimensionError(ValueError):
     """The model returned vectors of a different size than EMBEDDING_DIMENSIONS."""
 
@@ -137,7 +144,10 @@ def build_embed_fn(
     client = _build_client(settings, api_version, timeout, max_retries)
 
     def embed(text: str) -> list[float]:
-        result = client.embeddings.create(model=spec.model, input=[text])
+        # The query side of the model's prompt pair (empty for text-embedding-3).
+        result = client.embeddings.create(
+            model=spec.model, input=[spec.query_text(text)], **request_options(spec)
+        )
         # No-op outside a pipeline run, so ingest callers are unaffected.
         record_openai_embedding(STAGE_QUERY_EMBEDDING, spec.model, result)
         return check_dimensions(spec, [list(result.data[0].embedding)])[0]
@@ -186,6 +196,10 @@ def build_batch_embed_fn(
 ) -> Callable[[list[str]], list[list[float]]]:  # pragma: no cover - live Azure call
     """Return `embed_batch(texts) -> list[vector]` sending many inputs per request.
 
+    Embeds the texts as given: no prompt is added here. Stored documents get the
+    model's document prompt from ``pg_write.document_input``, queries go through
+    ``build_embed_fn``, which adds the query prompt.
+
     The embeddings API accepts an array of inputs in a single request, so a batch
     of N chunks costs one request instead of N. This is essential for bulk ingest:
     it keeps total requests far under the deployment's per-10s request limit (the
@@ -204,7 +218,7 @@ def build_batch_embed_fn(
     client = _build_client(settings, api_version, timeout, max_retries)
 
     def _embed_one(sub: list[str]) -> list[list[float]]:
-        result = client.embeddings.create(model=spec.model, input=sub)
+        result = client.embeddings.create(model=spec.model, input=sub, **request_options(spec))
         if on_tokens is not None and result.usage is not None:
             on_tokens(result.usage.prompt_tokens)
         ordered = sorted(result.data, key=lambda d: d.index)

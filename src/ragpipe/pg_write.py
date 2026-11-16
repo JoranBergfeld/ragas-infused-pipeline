@@ -27,13 +27,49 @@ EMBEDDING_META_DDL = (
     "  table_name text PRIMARY KEY,\n"
     "  model text NOT NULL,\n"
     "  dimensions integer NOT NULL,\n"
+    "  query_prompt text NOT NULL DEFAULT '',\n"
+    "  document_prompt text NOT NULL DEFAULT '',\n"
     "  updated_at timestamptz NOT NULL DEFAULT now()\n"
     ")"
+)
+# For a record table created before the prompts were part of the identity.
+EMBEDDING_META_MIGRATE = (
+    f"ALTER TABLE {EMBEDDING_META} "
+    "ADD COLUMN IF NOT EXISTS query_prompt text NOT NULL DEFAULT '', "
+    "ADD COLUMN IF NOT EXISTS document_prompt text NOT NULL DEFAULT ''"
 )
 
 
 class EmbeddingMismatch(RuntimeError):
-    """A table holds vectors from another model or dimension than the setting."""
+    """A table holds vectors from another model, dimension or prompt pair than
+    the setting."""
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """What ``rag.embedding_model`` says filled a table."""
+
+    model: str
+    dimensions: int
+    query_prompt: str = ""
+    document_prompt: str = ""
+
+    def differs_from(self, embedding: EmbeddingSpec) -> str | None:
+        """The first part of the embedding identity that differs, described, or None."""
+        for name, ours, theirs in (
+            ("model", self.model, embedding.model),
+            ("dimensions", self.dimensions, embedding.dimensions),
+            ("query prompt", self.query_prompt, embedding.query_prompt),
+            ("document prompt", self.document_prompt, embedding.document_prompt),
+        ):
+            if ours != theirs:
+                return f"{name} {ours!r}, the setting says {theirs!r}"
+        return None
+
+
+def _ensure_meta(conn) -> None:
+    conn.execute(EMBEDDING_META_DDL)
+    conn.execute(EMBEDDING_META_MIGRATE)
 
 
 def owner_database_url() -> str:  # pragma: no cover - env
@@ -53,7 +89,7 @@ def connect_owner():  # pragma: no cover - needs a database
 
     conn = psycopg.connect(owner_database_url(), autocommit=True)
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-    conn.execute(EMBEDDING_META_DDL)
+    _ensure_meta(conn)
     return conn
 
 
@@ -68,11 +104,14 @@ def _column_dimensions(conn, spec: TableSpec) -> int | None:
     return row[0] if row else None
 
 
-def _recorded(conn, spec: TableSpec) -> tuple[str, int] | None:
+_RECORD_COLUMNS = "model, dimensions, query_prompt, document_prompt"
+
+
+def _recorded(conn, spec: TableSpec) -> Recorded | None:
     row = conn.execute(
-        f"SELECT model, dimensions FROM {EMBEDDING_META} WHERE table_name = %s", (spec.table,)
+        f"SELECT {_RECORD_COLUMNS} FROM {EMBEDDING_META} WHERE table_name = %s", (spec.table,)
     ).fetchone()
-    return (row[0], row[1]) if row else None
+    return Recorded(*row) if row else None
 
 
 def mismatch_reason(
@@ -80,13 +119,14 @@ def mismatch_reason(
     embedding: EmbeddingSpec,
     *,
     column_dims: int | None,
-    recorded: tuple[str, int] | None,
+    recorded: Recorded | None,
 ) -> str | None:
     """Why ``spec``'s existing table can't take vectors from ``embedding``, or None.
 
     No table yet, or a table without a record (filled before records existed,
-    so assumed to be the current model), passes on the model; the column size
-    is checked whenever there is a column.
+    so assumed to be the current setting), passes; the column size is checked
+    whenever there is a column. The prompts count like the model: vectors made
+    with another prefix sit in a shifted space and rank worse without any error.
     """
     if spec.embed_input is None:
         return None
@@ -95,15 +135,17 @@ def mismatch_reason(
             f"{spec.qualified} holds vector({column_dims}), EMBEDDING_DIMENSIONS is "
             f"{embedding.dimensions}"
         )
-    if recorded is not None and recorded[0] != embedding.model:
-        return f"{spec.qualified} was embedded with {recorded[0]}, EMBEDDING_MODEL is {embedding.model}"
+    if recorded is not None:
+        diff = recorded.differs_from(embedding)
+        if diff:
+            return f"{spec.qualified} was embedded with {diff}"
     return None
 
 
 def check_writable(conn, spec: TableSpec, embedding: EmbeddingSpec) -> None:
-    """Raise EmbeddingMismatch if ``spec``'s table holds another model's vectors.
-    Ingest calls it before crawling, so a refusal costs nothing."""
-    conn.execute(EMBEDDING_META_DDL)
+    """Raise EmbeddingMismatch if ``spec``'s table holds another embedding's
+    vectors. Ingest calls it before crawling, so a refusal costs nothing."""
+    _ensure_meta(conn)
     reason = mismatch_reason(
         spec, embedding, column_dims=_column_dimensions(conn, spec), recorded=_recorded(conn, spec)
     )
@@ -118,7 +160,7 @@ def prepare_table(conn, spec: TableSpec, embedding: EmbeddingSpec, *, replace: b
     filled by another model or dimension raises EmbeddingMismatch, before
     anything is written.
     """
-    conn.execute(EMBEDDING_META_DDL)
+    _ensure_meta(conn)
     if replace:
         conn.execute(f"DROP TABLE IF EXISTS {spec.qualified}")
         conn.execute(f"DELETE FROM {EMBEDDING_META} WHERE table_name = %s", (spec.table,))
@@ -127,29 +169,48 @@ def prepare_table(conn, spec: TableSpec, embedding: EmbeddingSpec, *, replace: b
         conn.execute(stmt)
     if spec.embed_input is not None:
         conn.execute(
-            f"INSERT INTO {EMBEDDING_META} (table_name, model, dimensions) VALUES (%s, %s, %s) "
-            "ON CONFLICT (table_name) DO UPDATE "
-            "SET model = EXCLUDED.model, dimensions = EXCLUDED.dimensions, updated_at = now()",
-            (spec.table, embedding.model, embedding.dimensions),
+            f"INSERT INTO {EMBEDDING_META} (table_name, {_RECORD_COLUMNS}) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (table_name) DO UPDATE SET model = EXCLUDED.model, "
+            "dimensions = EXCLUDED.dimensions, query_prompt = EXCLUDED.query_prompt, "
+            "document_prompt = EXCLUDED.document_prompt, updated_at = now()",
+            (
+                spec.table, embedding.model, embedding.dimensions,
+                embedding.query_prompt, embedding.document_prompt,
+            ),
         )
+
+
+def document_input(
+    spec: TableSpec, row: dict[str, Any], embedding: EmbeddingSpec | None
+) -> str:
+    """The exact text a row's vector embeds: the table's ``embed_input`` behind the
+    model's document prompt, ``{title}`` filled from the row (graph entities have
+    a ``name`` instead). The one definition, shared by ingest and the import.
+    ``embedding`` None: no prompt (unit tests and prompt-less models)."""
+    assert spec.embed_input is not None
+    text = spec.embed_input(row)
+    if embedding is None:
+        return text
+    return embedding.document_text(text, row.get("title") or row.get("name"))
 
 
 def embed_rows(
     spec: TableSpec,
     rows: list[dict[str, Any]],
     embed_batch: Callable[[list[str]], list[list[float]]],
+    embedding: EmbeddingSpec | None = None,
     *,
     batch_size: int = 256,
     log: Callable[[str], None] = print,
 ) -> list[dict[str, Any]]:
-    """``rows`` with an ``embedding`` each, from ``spec.embed_input``: the one
-    definition of what a table's vectors embed, shared with the import."""
+    """``rows`` with an ``embedding`` each, of ``document_input``."""
     if spec.embed_input is None:
         return rows
     out: list[dict[str, Any]] = []
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
-        vectors = embed_batch([spec.embed_input(r) for r in batch])
+        vectors = embed_batch([document_input(spec, r, embedding) for r in batch])
         out.extend({**r, "embedding": v} for r, v in zip(batch, vectors))
         log(f"  embedded {len(out)}/{len(rows)} for {spec.qualified}")
     return out
@@ -243,16 +304,21 @@ def recorded_mismatch(conn, embedding: EmbeddingSpec) -> str | None:
     """For serving: why the tables can't be queried with ``embedding``, or None.
 
     No record table (a database filled before records existed) passes, since
-    there is nothing to compare against."""
+    there is nothing to compare against. Rows are read as JSON because the
+    service can't migrate a record table that predates the prompt columns."""
     exists = conn.execute("SELECT to_regclass(%s)", (EMBEDDING_META,)).fetchone()[0]
     if exists is None:
         return None
-    for table, model, dims in conn.execute(
-        f"SELECT table_name, model, dimensions FROM {EMBEDDING_META} ORDER BY table_name"
+    for (row,) in conn.execute(
+        f"SELECT to_jsonb(m) FROM {EMBEDDING_META} m ORDER BY m.table_name"
     ):
-        if model != embedding.model or dims != embedding.dimensions:
-            return (
-                f"{SCHEMA}.{table} was embedded with {model} ({dims}d), the service "
-                f"queries with {embedding.model} ({embedding.dimensions}d)"
-            )
+        recorded = Recorded(
+            model=row["model"],
+            dimensions=row["dimensions"],
+            query_prompt=row.get("query_prompt", ""),
+            document_prompt=row.get("document_prompt", ""),
+        )
+        diff = recorded.differs_from(embedding)
+        if diff:
+            return f"{SCHEMA}.{row['table_name']} was embedded with {diff}"
     return None
