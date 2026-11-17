@@ -118,10 +118,10 @@ def build_context_complete_fn(
     non-default temperature values. Determinism comes from the content-addressed
     cache (ADR-0005), not from sampling parameters.
     """
-    from ragpipe.embeddings import _build_client
+    from ragpipe.embeddings import build_foundry_client
     from ragpipe.usage import STAGE_PLAN, record_openai_chat
 
-    client = _build_client(settings, api_version, timeout, max_retries)
+    client = build_foundry_client(settings, api_version, timeout, max_retries)
 
     def complete(prompt: str) -> str:
         resp = client.chat.completions.create(

@@ -194,3 +194,30 @@ def test_deepseek_offline_judge_passes_timeout_and_retries(monkeypatch):
     assert chat_kwargs["max_retries"] == foundry_judge.JUDGE_MAX_RETRIES
     assert emb_kwargs["timeout"] == harness.RAGAS_JUDGE_TIMEOUT
     assert emb_kwargs["max_retries"] == foundry_judge.JUDGE_MAX_RETRIES
+
+
+def test_context_complete_uses_foundry_even_with_embedding_base_url(monkeypatch):
+    # #49: the embedding setting's base_url is an embeddings-only server (the
+    # Spark). Chat for the agentic planner and situating context must still go
+    # to Foundry, or every plan call 404s.
+    import openai
+
+    from ragpipe.config import EmbeddingSpec
+    from ragpipe.context_gen import build_context_complete_fn
+
+    _inert_identity(monkeypatch)
+    captured: dict = {}
+    monkeypatch.setattr(openai, "AzureOpenAI", _openai_recorder(captured))
+    monkeypatch.setattr(
+        openai, "OpenAI", lambda **kw: pytest.fail("chat routed to the embedding server")
+    )
+    s = _S()
+    s.embedding = EmbeddingSpec(
+        model="google/embeddinggemma-2", dimensions=768,
+        base_url="http://127.0.0.1:8103/v1", api_key="k",
+    )
+    complete = build_context_complete_fn(s, timeout=12.0, max_retries=3)
+
+    assert complete("q") == "ok"
+    assert captured["azure_endpoint"] == "https://acct.openai.azure.com/"
+    assert captured["timeout"] == 12.0 and captured["max_retries"] == 3

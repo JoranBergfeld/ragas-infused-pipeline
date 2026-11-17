@@ -83,6 +83,18 @@ def _build_client(settings: Settings, api_version: str, timeout: float, max_retr
             max_retries=max_retries,
         )
 
+    return build_foundry_client(settings, api_version, timeout, max_retries)
+
+
+def build_foundry_client(
+    settings: Settings, api_version: str, timeout: float, max_retries: int
+):  # pragma: no cover - live Azure
+    """AzureOpenAI on the account's /openai endpoint with Entra auth.
+
+    Chat completions (situating context, the agentic planner) always go here: the
+    embedding setting's ``base_url`` points at an embeddings-only server, so it
+    must never route chat (#49).
+    """
     from azure.identity import DefaultAzureCredential, get_bearer_token_provider
     from openai import AzureOpenAI
 
