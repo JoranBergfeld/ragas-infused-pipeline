@@ -223,7 +223,7 @@ def _write(
 def _source_urls(limit: int | None) -> list[str]:  # pragma: no cover - file
     import yaml
 
-    with open("data/corpus_sources.yaml") as f:
+    with open("data/corpus_sources.yaml", encoding="utf-8") as f:
         urls = yaml.safe_load(f)["sources"]
     return urls[:limit] if limit is not None else urls
 

@@ -100,7 +100,7 @@ def main() -> None:  # pragma: no cover
         # pipeline + judges. Stripping the top-level "mode" key reconstructs this
         # mode's entry in the combined file's `modes` map exactly.
         if os.path.exists(filename):
-            with open(filename) as f:
+            with open(filename, encoding="utf-8") as f:
                 cached = json.load(f)
             results_by_mode[mode_value] = {k: v for k, v in cached.items() if k != "mode"}
             print(f"=== mode: {mode_value} === (cached: {filename})", flush=True)
@@ -134,7 +134,7 @@ def main() -> None:  # pragma: no cover
         # Write the per-mode file the moment its mode finishes: each is a
         # standalone, committable artifact and a checkpoint that lets a re-run
         # resume at the next unfinished mode (this run can take hours).
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(build_per_mode_payload(mode_value, mode_result), f, indent=2, allow_nan=False)
         print(f"wrote {filename}", flush=True)
 
@@ -156,7 +156,7 @@ def main() -> None:  # pragma: no cover
         "baseline_mode": baseline_mode,
         "paired_vs_baseline": paired_tests_vs_baseline(rows_by_mode, baseline_mode),
     }
-    with open("eval_results.json", "w") as f:
+    with open("eval_results.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, allow_nan=False)
 
     print(json.dumps({"means_by_mode": means_by_mode}, indent=2))

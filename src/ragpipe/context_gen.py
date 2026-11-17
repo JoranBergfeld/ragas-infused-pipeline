@@ -51,7 +51,7 @@ class ContextGenerator:
 
     def _load_cache(self) -> dict[str, str]:
         try:
-            return json.loads(self._cache_path.read_text())
+            return json.loads(self._cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}  # missing or corrupt -> empty, never an error (ADR-0005)
 
@@ -66,7 +66,7 @@ class ContextGenerator:
         directory = self._cache_path.parent if self._cache_path.parent != Path("") else Path(".")
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=self._cache_path.name + ".", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(self._cache, handle)
             os.replace(tmp, self._cache_path)
         except BaseException:
@@ -118,10 +118,10 @@ def build_context_complete_fn(
     non-default temperature values. Determinism comes from the content-addressed
     cache (ADR-0005), not from sampling parameters.
     """
-    from ragpipe.embeddings import _build_client
+    from ragpipe.embeddings import build_foundry_client
     from ragpipe.usage import STAGE_PLAN, record_openai_chat
 
-    client = _build_client(settings, api_version, timeout, max_retries)
+    client = build_foundry_client(settings, api_version, timeout, max_retries)
 
     def complete(prompt: str) -> str:
         resp = client.chat.completions.create(

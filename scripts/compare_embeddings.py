@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - live
 
     load_dotenv()
     base = Settings.from_env(load=False)
-    variants = json.loads(args.variants.read_text())
+    variants = json.loads(args.variants.read_text(encoding="utf-8"))
     tables = args.tables.split(",")
     items = [i for i in load_testset(TestsetMode.HANDAUTHORED) if i.ground_truth_context]
     export = read_export(args.export_dir.expanduser(), tuple(SPECS[t] for t in tables))
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - live
                     entry["vs_baseline"] = paired_randomization_test(vals, base_vals)
                 summary[t][name][m] = entry
     args.out.write_text(json.dumps({"variants": variants, "summary": summary,
-                                    "per_item": results}, indent=1, default=str))
+                                    "per_item": results}, indent=1, default=str), encoding="utf-8")
 
     for t in tables:
         metrics = list(results[baseline_name][t][0])

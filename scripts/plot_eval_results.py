@@ -41,7 +41,7 @@ def load_means(modes: list[str], results_dir: Path) -> dict[str, dict[str, float
         path = results_dir / f"eval_results_{mode}.json"
         if not path.exists():
             continue
-        means = json.loads(path.read_text()).get("means", {})
+        means = json.loads(path.read_text(encoding="utf-8")).get("means", {})
         out[mode] = {m: means.get(m) for m in RAGAS_METRICS}
     return out
 

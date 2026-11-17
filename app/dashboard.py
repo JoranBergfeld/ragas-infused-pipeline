@@ -316,7 +316,7 @@ def main() -> None:  # pragma: no cover - UI entry point
         )
         results_path = Path(EVAL_RESULTS_PATH)
         if results_path.exists():
-            results = json.loads(results_path.read_text())
+            results = json.loads(results_path.read_text(encoding="utf-8"))
             # New multi-mode shape: {"means_by_mode": {...}, "modes": {<mode>: {...}}}.
             # Show a per-mode comparison up front, then let the user drill into one
             # mode using the same single-run rendering below.
@@ -406,16 +406,16 @@ def main() -> None:  # pragma: no cover - UI entry point
     with tab_arch:
         diagram = Path(PIPELINE_DIAGRAM_PATH)
         if diagram.exists():
-            _render_mermaid(diagram.read_text())
+            _render_mermaid(diagram.read_text(encoding="utf-8"))
             with st.expander("Mermaid source"):
-                st.code(diagram.read_text(), language="text")
+                st.code(diagram.read_text(encoding="utf-8"), language="text")
         else:
             st.info(
                 f"No `{PIPELINE_DIAGRAM_PATH}` yet. Generate it with the WorkflowViz export."
             )
         for caption, path in available_architecture_diagrams():
             st.caption(caption)
-            _render_svg(Path(path).read_text())
+            _render_svg(Path(path).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":  # pragma: no cover
