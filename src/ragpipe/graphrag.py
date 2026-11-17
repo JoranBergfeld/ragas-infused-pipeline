@@ -219,7 +219,7 @@ def save_graph_state(
     directory = path.parent if str(path.parent) else Path(".")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=path.name + ".", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
         os.replace(tmp, path)
     except BaseException:
@@ -237,7 +237,7 @@ def load_graph_state(
     the cache is missing, corrupt, a different version, or built for a different
     `limit`, so the caller transparently falls back to a full rebuild."""
     try:
-        payload = json.loads(Path(path).read_text())
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):

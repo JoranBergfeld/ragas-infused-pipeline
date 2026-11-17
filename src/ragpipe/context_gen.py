@@ -51,7 +51,7 @@ class ContextGenerator:
 
     def _load_cache(self) -> dict[str, str]:
         try:
-            return json.loads(self._cache_path.read_text())
+            return json.loads(self._cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}  # missing or corrupt -> empty, never an error (ADR-0005)
 
@@ -66,7 +66,7 @@ class ContextGenerator:
         directory = self._cache_path.parent if self._cache_path.parent != Path("") else Path(".")
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=self._cache_path.name + ".", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(self._cache, handle)
             os.replace(tmp, self._cache_path)
         except BaseException:

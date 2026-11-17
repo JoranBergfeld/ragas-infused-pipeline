@@ -203,7 +203,7 @@ def evaluate() -> dict[str, Any]:
     path = Path(EVAL_RESULTS_PATH)
     if not path.exists():
         return {"overall": [], "perStage": {}, "nRecords": 0}
-    results = json.loads(path.read_text())
+    results = json.loads(path.read_text(encoding="utf-8"))
     # New shape: multi-mode eval with means_by_mode key.
     if "means_by_mode" in results:
         mode_results = results.get("modes", {})

@@ -136,3 +136,32 @@ def test_rows_to_items_drops_unrecoverable_rows():
         {"user_input": "q2", "reference": "", "reference_contexts": ["irrelevant"]},
     ]
     assert rows_to_items(rows, docs=[{"content": "other", "url": "http://x"}]) == []
+
+
+def test_handauthored_testset_is_read_as_utf8_whatever_the_locale(tmp_path, monkeypatch):
+    # A bare open() decodes with the locale encoding: cp1252 on Windows turned the
+    # testset's em-dashes into mojibake, so 7 of 43 eval questions went out altered.
+    # Simulate that locale so the test bites on every platform.
+    import builtins
+
+    import ragpipe.eval.testset as testset_mod
+
+    def cp1252_default_open(file, mode="r", *args, encoding=None, **kwargs):
+        if "b" not in mode and encoding is None:
+            encoding = "cp1252"
+        return builtins.open(file, mode, *args, encoding=encoding, **kwargs)
+
+    monkeypatch.setattr(testset_mod, "open", cp1252_default_open, raising=False)
+    question = "Two options exist — which one?"
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(
+        json.dumps(
+            {"question": question, "ground_truth": "x", "ground_truth_context": "u"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    [item] = testset_mod._load_jsonl(str(path))
+
+    assert item.question == question

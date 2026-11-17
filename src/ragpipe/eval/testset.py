@@ -23,7 +23,7 @@ class TestItem:
 
 def _load_jsonl(path: str) -> list[TestItem]:
     items: list[TestItem] = []
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
