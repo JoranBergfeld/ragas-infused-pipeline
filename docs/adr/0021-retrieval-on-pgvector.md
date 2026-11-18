@@ -236,8 +236,10 @@ rather than a text assumption to unpick.
 `task: question answering | query: ` and `title: none | text: `. On `ms_docs`, Gemma
 shows no measurable difference from `text-embedding-3-small`. On the plain `baseline`
 table it loses about 4 of 43 gold pages from the fused candidates. That's recorded as the
-expected cost of choosing a multimodal model. The full eval after the re-ingest is the
-real measurement.
+expected cost of choosing a multimodal model. The full eval after the re-ingest
+(`docs/eval-history.md` 2026-11-18) confirmed it. Across all nine modes, no metric moved
+significantly. `baseline` lost the predicted 0.06 fused hit rate, and its context recall
+dropped too, both inside the noise.
 
 ### Rejected (#47)
 
