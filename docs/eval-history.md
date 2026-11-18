@@ -6,6 +6,64 @@ log of what they said before, so a re-run doesn't quietly erase the last baselin
 Newest first. Means over `data/testset.jsonl`. With n in the tens, treat anything inside
 the confidence intervals as "no measurable difference" (ADR-0018).
 
+## 2026-11-18: all nine modes on EmbeddingGemma 2 (#47, #50)
+
+This is the first full run after homelab's `rag` tables were re-embedded with `google/embeddinggemma-2` on the Spark:
+- 768 dims;
+- query prompt `task: question answering | query: `;
+- document prompt `title: none | text: `.
+
+**Setup.** The corpus is the same 2026-10-24 export. These are unchanged from the run before:
+- the 43 questions;
+- the Spark reranker (`nvidia/llama-nemotron-rerank-1b-v2`);
+- the Foundry generator;
+- the online judge;
+- the offline judge (`DeepSeek-V4-Pro`), on ragas 0.4.3 and Python 3.11.
+
+It ran from the laptop through an SSH tunnel to the Spark, on code identical to ac5a418 (#50 merged). Retrieval used the read-only `rag_service` login. The "before" numbers are the text-embedding-3-small@1536 files from bd3ec63.
+
+**Two things besides the model changed:**
+
+- **`raptor_sac` leaves embed differently.** Since #46 they embed `context + content`, where before they embedded the content alone. Its delta is model plus input.
+- **The first attempt was thrown away.** Two bugs made it invalid, both fixed in #50:
+  - The agentic planner's chat calls went to the embedding server and 404'd. All four `*_agentic` modes silently ran single-query (#49).
+  - On Windows, the testset was read as cp1252, so the 7 questions with an em-dash went out as mojibake.
+
+  These numbers are from the clean rerun. The agentic records show 2–3 sub-query rounds per question.
+
+te3s → Gemma. `*` marks a te3s mean outside the new run's 95% interval:
+
+| mode | hit_rate@fused | mrr@reranked | faithfulness | answer_relevancy | context_precision | context_recall | abstained |
+|---|---|---|---|---|---|---|---|
+| contextual | 0.911 → 0.937 | 0.779 → 0.790 | 0.853 → 0.867 | 0.846 → 0.885 | 0.709 → 0.685 | 0.791 → 0.838 | 0.093 → 0.047 |
+| baseline | 0.966 → 0.903 | 0.811 → 0.759 | 0.896 → 0.879 | 0.878 → 0.873 | 0.716 → 0.677 | 0.869 → 0.798 | 0.093 → 0.023* |
+| raptor_sac | 0.966 → 0.928 | 0.813 → 0.790 | 0.876 → 0.898 | 0.842 → 0.873 | 0.729 → 0.681 | 0.820 → 0.808 | 0.023 → 0.116 |
+| graphrag | 0.956 → 0.902 | 0.571 → 0.568 | 0.818 → 0.798 | 0.743 → 0.813 | 0.463 → 0.416 | 0.321 → 0.352 | 0.279 → 0.349 |
+| combined | 0.984 → 0.959 | 0.760 → 0.746 | 0.892 → 0.905 | 0.895 → 0.873 | 0.603 → 0.577 | 0.672 → 0.607 | 0.140 → 0.093 |
+| baseline_agentic | 0.972 → 0.980 | 0.818 → 0.803 | 0.850 → 0.882 | 0.864 → 0.827 | 0.538 → 0.527 | 0.717 → 0.731 | 0.093 → 0.047 |
+| raptor_sac_agentic | 0.967 → 0.974 | 0.857 → 0.810 | 0.878 → 0.901 | 0.865 → 0.876 | 0.552 → 0.524 | 0.759 → 0.768 | 0.047 → 0.116 |
+| graphrag_agentic | 0.974 → 0.984 | 0.600 → 0.610 | 0.804 → 0.817 | 0.821 → 0.846 | 0.453 → 0.424 | 0.381 → 0.297 | 0.302 → 0.395 |
+| combined_agentic | 0.988 → 0.994 | 0.786 → 0.777 | 0.888 → 0.871 | 0.877 → 0.852 | 0.572 → 0.565 | 0.654 → 0.683 | 0.047 → 0.023 |
+
+Paired per question (all 43 pair up), no metric in any mode passes the randomization test at p < 0.05. Overall the switch is a wash: the multimodal option costs nothing measurable on text.
+
+Where the bootstrap interval on the paired difference excludes zero, though the randomization test doesn't confirm it:
+
+- **`baseline`:**
+  - hit_rate@fused −0.062 [−0.140, −0.008], p = 0.13.
+  - mrr@reranked −0.052 [−0.109, −0.009], p = 0.06.
+  - context_recall −0.067 [−0.147, −0.004], p = 0.13.
+
+  The hit-rate drop is exactly what the retrieval-only check predicted. Without the situating context, Gemma's dense leg finds fewer gold pages. This is the one mode where the switch probably costs something.
+- **`raptor_sac` abstained:** +0.093 [+0.023, +0.186], 4 more abstentions, p = 0.13. The model and the leaf input both changed, so this doesn't separate them.
+- **`combined_agentic` answer_relevancy:** −0.045 [−0.105, −0.001], p = 0.08.
+- **Every agentic mode:** hit_rate@fused is up +0.006 to +0.009, with intervals touching zero. One question gained per mode at most.
+
+**Coverage.**
+- faithfulness and answer_relevancy are scored on 26–42 of 43. They're lowest for `graphrag` (28) and `graphrag_agentic` (26), because abstentions aren't scored.
+- context_precision is scored on 41–43, context_recall on 42–43.
+- Lost judge jobs: five DeepSeek 429s and two timeouts. The reranker never reported `reranker-offline`.
+
 ## 2026-11-16: EmbeddingGemma 2 settings, retrieval only (#47)
 
 This isn't a mode run, and no `eval_results_*.json` changed. It was a check, before
