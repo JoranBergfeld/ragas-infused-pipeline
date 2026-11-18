@@ -14,11 +14,11 @@ from azure.ai.projects.models import CodeInterpreterTool, PromptAgentDefinition
 from azure.identity import DefaultAzureCredential
 
 from ragpipe.config import Settings
+from ragpipe.generate import GENERATOR_INSTRUCTIONS
 
-GENERATOR_INSTRUCTIONS = (
-    "You are a Microsoft/Azure documentation assistant. Answer the user's question "
-    "using only the provided context passages. Cite sources by their [n] index. "
-    "If the context is insufficient, say so. When the question involves counting, "
+# The shared instructions plus the Code Interpreter, which only the agent has.
+AGENT_INSTRUCTIONS = (
+    f"{GENERATOR_INSTRUCTIONS} When the question involves counting, "
     "comparing, or aggregating across passages, use the code interpreter tool to "
     "compute the answer precisely."
 )
@@ -26,6 +26,9 @@ GENERATOR_INSTRUCTIONS = (
 
 def main() -> None:
     settings = Settings.from_env()
+    if settings.generator.is_openai_compatible:
+        print("GENERATOR_BASE_URL is set: answers come from that server, no agent to register.")
+        return
     client = AIProjectClient(
         endpoint=settings.foundry_project_endpoint,
         credential=DefaultAzureCredential(),
@@ -34,7 +37,7 @@ def main() -> None:
         agent_name=settings.generator_agent_name,
         definition=PromptAgentDefinition(
             model=settings.foundry_chat_model,
-            instructions=GENERATOR_INSTRUCTIONS,
+            instructions=AGENT_INSTRUCTIONS,
             tools=[CodeInterpreterTool()],
         ),
     )

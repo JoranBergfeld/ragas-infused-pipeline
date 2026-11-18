@@ -93,6 +93,45 @@ def _table_pool(database_url: str):  # pragma: no cover - needs a database
     return _pools[database_url]
 
 
+def build_generator(settings: Settings, *, credential=None):  # pragma: no cover - live wiring
+    """The answer generator for ``settings.generator``: chat completions on an
+    OpenAI-compatible server when GENERATOR_BASE_URL is set (#52), else the
+    Foundry agent. Each route builds its own client (#49)."""
+    from ragpipe.generate import (
+        DEFAULT_GENERATE_TIMEOUT,
+        ChatCompletionsAgent,
+        Generator,
+        record_chat_reply,
+    )
+
+    spec = settings.generator
+    if spec.is_openai_compatible:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            base_url=spec.base_url,
+            api_key=spec.api_key or "unused",
+            # Generator applies the overall budget and its own retry; the client
+            # gets the same ceiling and no hidden retries on top.
+            timeout=DEFAULT_GENERATE_TIMEOUT,
+            max_retries=0,
+        )
+        agent = ChatCompletionsAgent(client, spec.model, temperature=spec.temperature)
+        return Generator(agent, deployment=spec.deployment, record_usage=record_chat_reply)
+
+    from agent_framework.foundry import FoundryAgent
+    from azure.identity import DefaultAzureCredential
+
+    agent = FoundryAgent(
+        project_endpoint=settings.foundry_project_endpoint,
+        agent_name=spec.agent_name,
+        agent_version=spec.agent_version,
+        credential=credential or DefaultAzureCredential(),
+    )
+    # setup_agents.py registers the agent against FOUNDRY_CHAT_MODEL.
+    return Generator(agent, deployment=spec.deployment)
+
+
 def build_pipeline_fn(
     settings: Settings,
     *,
@@ -101,10 +140,8 @@ def build_pipeline_fn(
     from functools import lru_cache
 
     from azure.identity import DefaultAzureCredential
-    from agent_framework.foundry import FoundryAgent
 
     from ragpipe.embeddings import build_embed_fn
-    from ragpipe.generate import Generator
     from ragpipe.faithfulness_gate import build_faithfulness_gate
     from ragpipe.pgstore import PgTable
     from ragpipe.retrieval.registry import build_substrate
@@ -171,18 +208,11 @@ def build_pipeline_fn(
 
     reranker = build_reranker(settings, mode)
 
-    agent = FoundryAgent(
-        project_endpoint=settings.foundry_project_endpoint,
-        agent_name=settings.generator_agent_name,
-        agent_version=settings.generator_agent_version,
-        credential=cred,
-    )
     deps = make_deps(
         settings,
         retrieve=substrate.retrieve,
         reranker=reranker,
-        # setup_agents.py registers the agent against FOUNDRY_CHAT_MODEL.
-        generator=Generator(agent, deployment=settings.foundry_chat_model),
+        generator=build_generator(settings, credential=cred),
         gate=build_faithfulness_gate(settings),
     )
 

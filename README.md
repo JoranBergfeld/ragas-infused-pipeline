@@ -22,8 +22,8 @@ Anthropic-contextual leaves; the legacy `sac` token in mode/index names refers t
 this implemented per-chunk technique, not per-document SAC from arXiv:2510.06999;
 ADR-0013), `graphrag` (flat graph; the global community leg is routed by query class, ADR-0014/0018), `combined`
 (RAPTOR ⊕ GraphRAG, RRF-fused), and the four `*_agentic` wrappers (bounded
-plan→retrieve loop, ADR-0015 — **experimental / unevaluated**, ADR-0018) — then a shared tail: rerank → Foundry
-generator agent, with a directive RAGAS faithfulness guardrail judged by Claude
+plan→retrieve loop, ADR-0015 — **experimental / unevaluated**, ADR-0018) — then a shared tail: rerank → generator
+(the Spark LLM, or the Foundry agent as fallback, ADR-0022), with a directive RAGAS faithfulness guardrail judged by Claude
 (ADR-0009) that widens the rerank window and regenerates on weak grounding, and
 abstains when retries exhaust (the gate scores **grounding in the retrieved
 context, not factual correctness** — a calibrated threshold + drift canary keep it

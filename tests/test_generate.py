@@ -147,3 +147,85 @@ async def test_generator_raises_after_exhausting_retries():
         await gen.generate("q", [_chunk("a", "Alpha.")])
 
     assert agent.calls == 3
+
+
+# --- OpenAI-compatible chat route (the Spark LLM, #52) ---
+
+
+class _FakeCompletions:
+    def __init__(self, text="Answer [1]."):
+        self.calls = []
+        self._text = text
+
+    async def create(self, **kwargs):
+        from types import SimpleNamespace
+
+        self.calls.append(kwargs)
+        message = SimpleNamespace(content=self._text)
+        usage = SimpleNamespace(
+            prompt_tokens=900, completion_tokens=40, prompt_tokens_details=None
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+
+def _fake_client(completions):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+
+async def test_chat_agent_sends_instructions_then_the_grounding_prompt():
+    from ragpipe.generate import GENERATOR_INSTRUCTIONS, ChatCompletionsAgent
+
+    completions = _FakeCompletions()
+    agent = ChatCompletionsAgent(_fake_client(completions), "nvidia/Qwen3.8-Flash-Next-NVFP4")
+
+    reply = await agent.run("PROMPT")
+
+    assert reply.text == "Answer [1]."
+    [call] = completions.calls
+    assert call["model"] == "nvidia/Qwen3.8-Flash-Next-NVFP4"
+    assert call["messages"] == [
+        {"role": "system", "content": GENERATOR_INSTRUCTIONS},
+        {"role": "user", "content": "PROMPT"},
+    ]
+    # Unset temperature leaves sampling to the server's defaults.
+    assert "temperature" not in call
+
+
+async def test_chat_agent_sends_temperature_only_when_set():
+    from ragpipe.generate import ChatCompletionsAgent
+
+    completions = _FakeCompletions()
+    await ChatCompletionsAgent(_fake_client(completions), "m", temperature=0.2).run("p")
+    assert completions.calls[0]["temperature"] == 0.2
+
+
+async def test_chat_agent_empty_content_is_an_empty_answer():
+    from ragpipe.generate import ChatCompletionsAgent
+
+    completions = _FakeCompletions(text=None)
+    reply = await ChatCompletionsAgent(_fake_client(completions), "m").run("p")
+    assert reply.text == ""
+
+
+async def test_generator_on_the_chat_route_records_chat_usage_under_the_model():
+    from ragpipe.generate import ChatCompletionsAgent, record_chat_reply
+    from ragpipe.usage import STAGE_GENERATION, UsageEntry, collect_usage
+
+    agent = ChatCompletionsAgent(_fake_client(_FakeCompletions()), "qwen")
+    gen = Generator(agent, deployment="qwen", record_usage=record_chat_reply)
+
+    with collect_usage([]) as entries:
+        answer = await gen.generate("q?", [_chunk("a", "Alpha fact.")])
+
+    assert answer == "Answer [1]."
+    assert entries == [
+        UsageEntry(stage=STAGE_GENERATION, deployment="qwen", input_tokens=900, output_tokens=40)
+    ]
+
+
+def test_agent_instructions_keep_the_code_interpreter_line_for_foundry_only():
+    from ragpipe.generate import GENERATOR_INSTRUCTIONS
+
+    assert "code interpreter" not in GENERATOR_INSTRUCTIONS.lower()

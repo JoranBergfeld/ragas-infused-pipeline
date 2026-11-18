@@ -221,3 +221,39 @@ def test_context_complete_uses_foundry_even_with_embedding_base_url(monkeypatch)
     assert complete("q") == "ok"
     assert captured["azure_endpoint"] == "https://acct.openai.azure.com/"
     assert captured["timeout"] == 12.0 and captured["max_retries"] == 3
+
+
+def test_generator_client_is_its_own_never_the_embedders(monkeypatch):
+    # #49 taught that sharing a client with the embedder misroutes chat. The
+    # generator's chat client targets GENERATOR_BASE_URL only (#52).
+    import openai
+
+    from ragpipe.app_wiring import build_generator
+    from ragpipe.config import Settings
+
+    captured: dict = {}
+
+    class _AsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _AsyncOpenAI)
+    s = Settings(
+        foundry_project_endpoint=_S.foundry_project_endpoint,
+        foundry_chat_model="gpt-5.4",
+        foundry_embedding_model="text-embedding-3-small",
+        embedding_model="google/embeddinggemma-2",
+        embedding_dimensions=768,
+        embedding_base_url="http://127.0.0.1:8103/v1",
+        embedding_api_key="embed-key",
+        generator_base_url="http://127.0.0.1:8101/v1",
+        generator_api_key="llm-key",
+        generator_model="nvidia/Qwen3.8-Flash-Next-NVFP4",
+    )
+
+    gen = build_generator(s)
+
+    assert captured["base_url"] == "http://127.0.0.1:8101/v1"
+    assert captured["api_key"] == "llm-key"
+    assert captured["timeout"] > 0 and captured["max_retries"] == 0
+    assert gen._deployment == "nvidia/Qwen3.8-Flash-Next-NVFP4"
