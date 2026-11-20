@@ -6,6 +6,78 @@ log of what they said before, so a re-run doesn't quietly erase the last baselin
 Newest first. Means over `data/testset.jsonl`. With n in the tens, treat anything inside
 the confidence intervals as "no measurable difference" (ADR-0018).
 
+## 2026-11-20: all nine modes with answers from the Spark LLM (#52, #53)
+
+Generation moved from the Foundry agent (`gpt-5.4` with Code Interpreter) to
+`nvidia/Qwen3.8-Flash-Next-NVFP4` on the Spark's vLLM (ADR-0022). Thinking was off and
+sampling was vLLM's `generation_config` default.
+
+**Setup.** Nothing else changed from the 2026-11-18 run below:
+- the corpus and the EmbeddingGemma 2 tables;
+- the 43 questions;
+- the Spark reranker;
+- the Claude online gate;
+- the DeepSeek offline judge;
+- the gpt-4o agentic planner;
+- the Foundry situating context.
+
+It ran from the laptop through SSH tunnels to the Spark (8100, 8101, 8103), on code
+identical to afe8c43 (#53 merged). All 43 questions pair up in every mode, with no failed
+records.
+
+Gemma run → Spark generator. `*` marks a paired randomization test at p < 0.05:
+
+| mode | hit_rate@fused | mrr@reranked | faithfulness | answer_relevancy | context_precision | context_recall | abstained |
+|---|---|---|---|---|---|---|---|
+| contextual | 0.937 → 0.937 | 0.790 → 0.787 | 0.867 → 0.920 | 0.885 → 0.850 | 0.685 → 0.692 | 0.838 → 0.811 | 0.047 → 0.023 |
+| baseline | 0.903 → 0.903 | 0.759 → 0.756 | 0.879 → 0.924 | 0.873 → 0.848 | 0.677 → 0.660 | 0.798 → 0.794 | 0.023 → 0.023 |
+| raptor_sac | 0.928 → 0.928 | 0.790 → 0.787 | 0.898 → 0.895 | 0.873 → 0.853 | 0.681 → 0.728 | 0.808 → 0.831 | 0.116 → 0.000 |
+| graphrag | 0.902 → 0.902 | 0.568 → 0.555 | 0.798 → 0.814 | 0.813 → 0.745 | 0.416 → 0.423 | 0.352 → 0.375 | 0.349 → 0.093* |
+| combined | 0.959 → 0.959 | 0.746 → 0.746 | 0.905 → 0.898 | 0.873 → 0.837 | 0.577 → 0.558 | 0.607 → 0.618 | 0.093 → 0.116 |
+| baseline_agentic | 0.980 → 0.985 | 0.803 → 0.819 | 0.882 → 0.875 | 0.827 → 0.826 | 0.527 → 0.570 | 0.731 → 0.727 | 0.047 → 0.047 |
+| raptor_sac_agentic | 0.974 → 0.985 | 0.810 → 0.831 | 0.901 → 0.893 | 0.876 → 0.816* | 0.524 → 0.563 | 0.768 → 0.683 | 0.116 → 0.070 |
+| graphrag_agentic | 0.984 → 0.984 | 0.610 → 0.615 | 0.817 → 0.825 | 0.846 → 0.740 | 0.424 → 0.476 | 0.297 → 0.341 | 0.395 → 0.140* |
+| combined_agentic | 0.994 → 0.988 | 0.777 → 0.845* | 0.871 → 0.902 | 0.852 → 0.783 | 0.565 → 0.671* | 0.683 → 0.676 | 0.023 → 0.047 |
+
+The plain means of the answer metrics compare different sets of answers: an abstention isn't
+scored, and the Spark run abstains less. The paired deltas below are the ones to read.
+
+**Fewer abstentions in graphrag, much fewer.** `graphrag` went from 15 to 4 abstentions
+(paired −0.256, p = 0.007) and `graphrag_agentic` from 17 to 6 (−0.256, p = 0.002).
+`raptor_sac` went from 5 to 0 (p = 0.066). The answers that newly pass the faithfulness gate
+still cite their passages: 39 of 39 in `graphrag`, 37 of 37 in `graphrag_agentic`. Paired
+faithfulness doesn't move in either mode. Qwen grounds its answers in the graph's
+entity and community text on the first try, where the agent's didn't pass the gate within
+the retry budget.
+
+**Answer relevancy a little lower.** It is down in 8 of the 9 modes. Pooled over all paired
+answers (n = 320) the drop is −0.027 [−0.049, −0.006], p = 0.018. Per mode only
+`raptor_sac_agentic` is significant (−0.083, p = 0.006). Faithfulness pooled is +0.012,
+p = 0.25: no measurable change.
+
+**`combined_agentic`'s retrieval gains aren't the generator's.** mrr@reranked +0.068 and
+context_precision +0.107 come from what the gpt-4o planner chose to retrieve. The planner
+isn't deterministic across runs, and nothing on the retrieval side changed.
+
+**hit_rate@reranked dips slightly in the single-shot modes** (−0.008 in most of them; −0.093
+in `graphrag`, p = 0.13). That isn't a retrieval change either. The rerank window widens on
+each retry, so fewer retries leave a narrower final window.
+
+**No sign that losing Code Interpreter hurt** (ADR-0022's open question), though each
+cohort has only 5 questions:
+- **`global`:** faithfulness is up in all nine modes (+0.005 to +0.195), and relevancy is up
+  in seven.
+- **`multihop`:** mixed. Faithfulness is down in the baseline and raptor agentic modes
+  (−0.124, −0.095) and up in the single-shot ones. Relevancy is down in five of nine modes.
+
+The graphrag abstention drop doesn't come from these cohorts: `global` abstains once more in
+both graph modes.
+
+Nine modes × seven metrics is 63 tests, so about three would pass p < 0.05 by chance. Only the
+two graphrag abstention drops are both strong and explained by a mechanism. Overall, the move
+to the Spark is neutral on quality, a little lower on relevancy, and a real gain in
+answered questions for the graph modes.
+
 ## 2026-11-18: all nine modes on EmbeddingGemma 2 (#47, #50)
 
 This is the first full run after homelab's `rag` tables were re-embedded with `google/embeddinggemma-2` on the Spark:
