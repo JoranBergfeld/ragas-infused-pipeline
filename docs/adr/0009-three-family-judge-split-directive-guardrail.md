@@ -15,7 +15,8 @@ candidate set ("regenerate and hope").
 
 ## Decision
 
-1. **Three families.** Generator: `gpt-5.4` (OpenAI). Online faithfulness gate:
+1. **Three families.** Generator: `gpt-5.4` (OpenAI); since ADR-0022, Qwen on the
+   Spark, with `gpt-5.4` as the fallback. Online faithfulness gate:
    `claude-sonnet-4-6` (Anthropic, Messages API on the account's `/anthropic`
    route, Entra bearer with scope `https://ai.azure.com/.default`; the SDK's
    `X-Api-Key` header is suppressed so only the bearer reaches the gateway).

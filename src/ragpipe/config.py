@@ -117,6 +117,46 @@ class EmbeddingSpec:
         return f"{prefix}{text}"
 
 
+@dataclass(frozen=True)
+class GeneratorSpec:
+    """Where answers are generated. ``base_url`` set: an OpenAI-compatible
+    /v1/chat/completions server running ``model``. Unset: the Foundry agent
+    ``agent_name`` (on ``foundry_model``), as before #52."""
+
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+    agent_name: str | None = None
+    agent_version: str | None = None
+    foundry_model: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if self.base_url and not self.model:
+            raise ValueError("GENERATOR_MODEL is required when GENERATOR_BASE_URL is set")
+        if not self.base_url and not self.agent_name:
+            raise ValueError(
+                "Required environment variable GENERATOR_AGENT_NAME is not set "
+                "(or set GENERATOR_BASE_URL and GENERATOR_MODEL)"
+            )
+        if self.temperature is not None and self.temperature < 0:
+            raise ValueError(f"GENERATOR_TEMPERATURE must be >= 0, got {self.temperature}")
+
+    @property
+    def is_openai_compatible(self) -> bool:
+        return bool(self.base_url)
+
+    @property
+    def deployment(self) -> str:
+        """The model name reported with each generation call's usage."""
+        return (self.model if self.base_url else self.foundry_model) or "unknown"
+
+
+def _optional_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else None
+
+
 def _require(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -129,7 +169,8 @@ class Settings:
     foundry_project_endpoint: str
     foundry_chat_model: str
     foundry_embedding_model: str
-    generator_agent_name: str
+    # Foundry agent route (the fallback): required unless generator_base_url is set.
+    generator_agent_name: str | None = None
     generator_agent_version: str | None = None
     faithfulness_threshold: float = 0.7
     max_retries: int = 2
@@ -169,6 +210,26 @@ class Settings:
     embedding_api_key: str | None = None
     embedding_query_prompt: str = ""
     embedding_document_prompt: str = ""
+    # Answer generation on an OpenAI-compatible server (the Spark LLM, #52). Unset:
+    # the Foundry agent above. Its own client, never the embedder's (#49).
+    generator_base_url: str | None = None
+    generator_api_key: str | None = None
+    generator_model: str | None = None
+    # None: the server's own sampling defaults (vLLM uses the model's
+    # generation_config, Qwen's recommended non-thinking settings).
+    generator_temperature: float | None = None
+
+    @property
+    def generator(self) -> GeneratorSpec:
+        return GeneratorSpec(
+            base_url=self.generator_base_url,
+            api_key=self.generator_api_key,
+            model=self.generator_model,
+            temperature=self.generator_temperature,
+            agent_name=self.generator_agent_name,
+            agent_version=self.generator_agent_version,
+            foundry_model=self.foundry_chat_model,
+        )
 
     @property
     def embedding(self) -> EmbeddingSpec:
@@ -198,6 +259,8 @@ class Settings:
             raise ValueError(
                 f"EMBEDDING_DIMENSIONS must be >= 1, got {self.embedding_dimensions}"
             )
+        # Validates the generator route (GeneratorSpec.__post_init__).
+        self.generator
 
     @classmethod
     def from_env(cls, *, load: bool = True) -> "Settings":
@@ -207,8 +270,8 @@ class Settings:
             foundry_project_endpoint=_require("FOUNDRY_PROJECT_ENDPOINT"),
             foundry_chat_model=_require("FOUNDRY_CHAT_MODEL"),
             foundry_embedding_model=_require("FOUNDRY_EMBEDDING_MODEL"),
-            generator_agent_name=_require("GENERATOR_AGENT_NAME"),
-            generator_agent_version=os.environ.get("GENERATOR_AGENT_VERSION"),
+            generator_agent_name=os.environ.get("GENERATOR_AGENT_NAME") or None,
+            generator_agent_version=os.environ.get("GENERATOR_AGENT_VERSION") or None,
             faithfulness_threshold=float(os.environ.get("FAITHFULNESS_THRESHOLD", "0.7")),
             max_retries=int(os.environ.get("MAX_RETRIES", "2")),
             top_k=int(os.environ.get("TOP_K", "5")),
@@ -232,4 +295,8 @@ class Settings:
             # Not stripped: the trailing space after "query:" is part of the prompt.
             embedding_query_prompt=os.environ.get("EMBEDDING_QUERY_PROMPT", ""),
             embedding_document_prompt=os.environ.get("EMBEDDING_DOCUMENT_PROMPT", ""),
+            generator_base_url=os.environ.get("GENERATOR_BASE_URL") or None,
+            generator_api_key=os.environ.get("GENERATOR_API_KEY") or None,
+            generator_model=os.environ.get("GENERATOR_MODEL") or None,
+            generator_temperature=_optional_float("GENERATOR_TEMPERATURE"),
         )

@@ -212,3 +212,59 @@ def test_embedding_prompts_are_read_verbatim(monkeypatch):
     # the trailing space is part of the prompt
     assert e.query_prompt == "task: search result | query: "
     assert e.document_prompt == "title: none | text: "
+
+
+def _clear_generator_env(monkeypatch):
+    for k in ("GENERATOR_BASE_URL", "GENERATOR_API_KEY", "GENERATOR_MODEL",
+              "GENERATOR_TEMPERATURE", "GENERATOR_AGENT_VERSION"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_generator_defaults_to_the_foundry_agent(monkeypatch):
+    # Existing deployments set only GENERATOR_AGENT_NAME and must keep working.
+    _base_env(monkeypatch)
+    _clear_generator_env(monkeypatch)
+    g = Settings.from_env(load=False).generator
+    assert not g.is_openai_compatible
+    assert (g.agent_name, g.deployment) == ("gen", "gpt-5.4")
+
+
+def test_generator_on_an_openai_compatible_server_is_env_only(monkeypatch):
+    # The Spark LLM (#52). Port 8101 is an A/B slot, so the model is a setting.
+    _base_env(monkeypatch)
+    _clear_generator_env(monkeypatch)
+    monkeypatch.delenv("GENERATOR_AGENT_NAME")
+    monkeypatch.setenv("GENERATOR_BASE_URL", "http://spark:8101/v1")
+    monkeypatch.setenv("GENERATOR_API_KEY", "k")
+    monkeypatch.setenv("GENERATOR_MODEL", "nvidia/Qwen3.8-Flash-Next-NVFP4")
+    monkeypatch.setenv("GENERATOR_TEMPERATURE", "0.2")
+    g = Settings.from_env(load=False).generator
+    assert g.is_openai_compatible
+    assert (g.base_url, g.api_key, g.model, g.temperature) == (
+        "http://spark:8101/v1", "k", "nvidia/Qwen3.8-Flash-Next-NVFP4", 0.2
+    )
+    assert g.deployment == "nvidia/Qwen3.8-Flash-Next-NVFP4"
+
+
+def test_generator_base_url_needs_a_model(monkeypatch):
+    _base_env(monkeypatch)
+    _clear_generator_env(monkeypatch)
+    monkeypatch.setenv("GENERATOR_BASE_URL", "http://spark:8101/v1")
+    with pytest.raises(ValueError, match="GENERATOR_MODEL"):
+        Settings.from_env(load=False)
+
+
+def test_generator_needs_an_agent_or_a_server(monkeypatch):
+    _base_env(monkeypatch)
+    _clear_generator_env(monkeypatch)
+    monkeypatch.delenv("GENERATOR_AGENT_NAME")
+    with pytest.raises(ValueError, match="GENERATOR_AGENT_NAME"):
+        Settings.from_env(load=False)
+
+
+def test_generator_temperature_must_not_be_negative(monkeypatch):
+    _base_env(monkeypatch)
+    _clear_generator_env(monkeypatch)
+    monkeypatch.setenv("GENERATOR_TEMPERATURE", "-0.1")
+    with pytest.raises(ValueError, match="GENERATOR_TEMPERATURE"):
+        Settings.from_env(load=False)

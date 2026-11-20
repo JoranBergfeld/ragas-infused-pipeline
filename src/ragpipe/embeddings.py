@@ -14,9 +14,8 @@ an empty body and `grpc-message: Unrecognized endpoint`.) So for an Azure OpenAI
 model the correct client is the OpenAI-compatible one, not `FoundryEmbeddingClient`.
 
 We reach the deployed model through the Foundry account's Azure OpenAI endpoint
-(`<account>.openai.azure.com`) with a Microsoft Entra token — no API key. Generation still
-uses `FoundryAgent` (the Foundry Agent Service); only embeddings use this OpenAI path,
-which matches how the embedding model is actually served.
+(`<account>.openai.azure.com`) with a Microsoft Entra token — no API key. Generation does
+not use these clients: it has its own (`app_wiring.build_generator`, ADR-0022).
 """
 from __future__ import annotations
 

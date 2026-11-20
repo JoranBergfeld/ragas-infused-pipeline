@@ -1,9 +1,11 @@
 # ragas-infused-pipeline (`ragpipe`)
 
 Observable hybrid-retrieval RAG over Microsoft/Azure docs, evaluated with RAGAS.
-Generation, embeddings and judges run on Microsoft Agent Framework + Azure AI Foundry;
-retrieval is pgvector in homelab's Postgres (ADR-0021) and the rerank modes call a
-cross-encoder on vLLM on the DGX Spark (`retrieval/cross_encoder.py`, issue #40). The `ragpipe`
+Judges, the agentic planner and the situating context run on Azure AI Foundry. Answer
+generation runs on the DGX Spark's LLM when `GENERATOR_BASE_URL` is set, with the Foundry
+agent as the fallback (ADR-0022). Retrieval is pgvector in homelab's Postgres (ADR-0021),
+and the rerank modes call a cross-encoder on vLLM on the DGX Spark
+(`retrieval/cross_encoder.py`, issue #40). The `ragpipe`
 package (`src/ragpipe/`) holds the pipeline; `app/` is the Streamlit UI + FastAPI
 service. Read `README.md` for setup/run/eval commands and `docs/adr/` for the *why*
 behind every significant design decision.
@@ -37,7 +39,9 @@ Three phases (see the diagram in `README.md` / `docs/pipeline*.svg`):
    Never hard-code a model name or `vector(N)` size.
 2. **Query pipeline**: `app_wiring.build_pipeline_fn(settings, *, mode)` assembles a
    substrate + reranker (`build_reranker`: the Spark cross-encoder for `RERANK_MODES`,
-   score-sort passthrough otherwise) + Foundry generator agent + RAGAS faithfulness judge into
+   score-sort passthrough otherwise) + generator (`build_generator`: the Spark LLM over chat
+   completions when `GENERATOR_BASE_URL` is set, else the Foundry agent, ADR-0022) + RAGAS
+   faithfulness judge into
    `PipelineDeps`, then `workflow.run_pipeline` executes: retrieve **once** → loop
    {rerank (window widens each retry) → generate → faithfulness score → `decide_next`}.
    On `PASS` it returns; on `EXHAUSTED` it sets `abstained` and replaces the answer with
@@ -55,7 +59,8 @@ of retrieval changes. `PipelineState.stages` is a **dynamic `dict[str, list[Chun
 each substrate names its own stages and the final set is always mirrored under `"reranked"`.
 Do not reintroduce fixed `dense`/`bm25` stage fields.
 
-**Three-family judge split (ADR-0009/0011).** The generator (gpt), the online faithfulness
+**Three-family judge split (ADR-0009/0011).** The generator (Qwen on the Spark, or gpt on the
+Foundry fallback), the online faithfulness
 gate (Claude/Anthropic, `JUDGE_MODEL`), and the offline RAGAS judge (DeepSeek,
 `OFFLINE_JUDGE_MODEL`) are deliberately different model families to avoid self-preference
 bias. `foundry_judge.judge_provider()` routes Anthropic vs. the OpenAI-compatible Foundry

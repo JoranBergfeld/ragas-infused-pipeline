@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol
 
 from ragpipe.models import Chunk
-from ragpipe.usage import STAGE_GENERATION, record_agent_response, record_tokens
+from ragpipe.usage import (
+    STAGE_GENERATION,
+    record_agent_response,
+    record_openai_chat,
+    record_tokens,
+)
 
 # Without an application-level timeout, a single stalled FoundryAgent call
 # (request sent, ACKed, but no response — no keepalive on the socket) blocks the
@@ -18,6 +24,65 @@ DEFAULT_GENERATE_MAX_RETRIES = 1
 
 class _Agent(Protocol):
     async def run(self, prompt: str): ...
+
+
+# The generator's standing instructions. The Foundry agent holds them server-side
+# (scripts/setup_agents.py adds a Code Interpreter line); the chat route sends them
+# as the system message on every call.
+GENERATOR_INSTRUCTIONS = (
+    "You are a Microsoft/Azure documentation assistant. Answer the user's question "
+    "using only the provided context passages. Cite sources by their [n] index. "
+    "If the context is insufficient, say so."
+)
+
+
+@dataclass(frozen=True)
+class ChatReply:
+    """One chat completion: the answer text plus the raw response for usage."""
+
+    text: str
+    response: Any
+
+
+class ChatCompletionsAgent:
+    """`run(prompt)` over an OpenAI-compatible /v1/chat/completions server (the
+    Spark LLM, #52), shaped like the Foundry agent so `Generator` drives either.
+
+    `client` is an `openai.AsyncOpenAI` built for the generator alone, never the
+    embedding client (#49). No tools: the Code Interpreter is a Foundry-agent
+    feature. `temperature` None leaves sampling to the server's defaults.
+    """
+
+    def __init__(
+        self,
+        client,
+        model: str,
+        *,
+        instructions: str = GENERATOR_INSTRUCTIONS,
+        temperature: float | None = None,
+    ) -> None:
+        self._client = client
+        self._model = model
+        self._instructions = instructions
+        self._temperature = temperature
+
+    async def run(self, prompt: str) -> ChatReply:
+        options: dict[str, Any] = {}
+        if self._temperature is not None:
+            options["temperature"] = self._temperature
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": self._instructions},
+                {"role": "user", "content": prompt},
+            ],
+            **options,
+        )
+        return ChatReply(text=response.choices[0].message.content or "", response=response)
+
+
+def record_chat_reply(stage: str, deployment: str, reply: ChatReply) -> None:
+    record_openai_chat(stage, deployment, reply.response)
 
 
 CORRECTIVE_INSTRUCTION = (
@@ -57,8 +122,12 @@ class Generator:
         timeout: float = DEFAULT_GENERATE_TIMEOUT,
         max_retries: int = DEFAULT_GENERATE_MAX_RETRIES,
         deployment: str = "unknown",
+        record_usage: Callable[[str, str, Any], None] = record_agent_response,
     ) -> None:
         self._agent = agent
+        # How this agent's result reports usage: the Foundry agent's
+        # AgentResponse, or record_chat_reply for ChatCompletionsAgent.
+        self._record_usage = record_usage
         # Model deployment behind the agent, reported with each call's usage.
         self._deployment = deployment
         self._timeout = timeout
@@ -80,7 +149,7 @@ class Generator:
                 # TimeoutError semantics are identical.
                 async with asyncio.timeout(self._timeout):
                     result = await self._agent.run(prompt)
-                record_agent_response(STAGE_GENERATION, self._deployment, result)
+                self._record_usage(STAGE_GENERATION, self._deployment, result)
                 return result.text
             except asyncio.TimeoutError as exc:
                 # The request was sent and may be billed, but no usage came back.
