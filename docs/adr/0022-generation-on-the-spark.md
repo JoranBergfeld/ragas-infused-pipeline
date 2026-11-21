@@ -76,6 +76,14 @@ None of these judges its own family.
   `RAG_TIMEOUT_MS` has to cover generation at p95 plus the guardrail's retries.
 - **Swapping the model in the A/B slot is env only**, and so is going back to Foundry.
 
+## Outcome
+
+In the full nine-mode eval against the Gemma run (`docs/eval-history.md`, 2026-11-20), quality held:
+- **Faithfulness:** unchanged (pooled +0.012, p = 0.25).
+- **Answer relevancy:** pooled −0.027 (p = 0.018).
+- **Abstentions:** the graph modes abstain far less (`graphrag` 15 → 4, `graphrag_agentic`
+  17 → 6, p ≤ 0.007).
+
 ## Sources
 
 - vLLM OpenAI-compatible server, chat completions and `generation_config` defaults:
